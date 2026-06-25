@@ -51,6 +51,7 @@ class ToyConfig:
     batch_independent_guidance: bool
     advantage_normalization: bool
     initial_advantage_second_moment_ema: float
+    grid_mode: str
     grid_min: float
     grid_max: float
     grid_points: int
@@ -96,6 +97,19 @@ class ToyModel:
         )
         resp = jax.nn.softmax(log_comp, axis=-1)
         return jnp.sum(resp * (-(x_exp - loc) / var), axis=-1)
+
+    def x0_hat_from_xt(self, act, t_idx):
+        loc, var = self._component_params(t_idx)
+        sqrt_ab = self.schedule.sqrt_alphas_cumprod[t_idx]
+        x = act[..., 0]
+        x_exp = x[..., None]
+        log_comp = (
+            jnp.log(self.weights)
+            - 0.5 * (jnp.log(2.0 * jnp.pi * var) + (x_exp - loc) ** 2 / var)
+        )
+        resp = jax.nn.softmax(log_comp, axis=-1)
+        posterior_mean = self.means + (sqrt_ab * self.stds ** 2 / var) * (x_exp - loc)
+        return jnp.sum(resp * posterior_mean, axis=-1)[..., None]
 
     def energy_fn(self, params, obs, act, t_idx):
         del params, obs
@@ -154,8 +168,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--advantage_normalization", action="store_true")
     p.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0)
 
-    p.add_argument("--grid_min", type=float, default=-2.0)
-    p.add_argument("--grid_max", type=float, default=2.0)
+    p.add_argument("--grid_mode", choices=["auto", "fixed"], default="auto",
+                   help="Use an adaptive plotting/evaluation grid per timestep, or fixed [grid_min, grid_max].")
+    p.add_argument("--grid_min", type=float, default=-6.0)
+    p.add_argument("--grid_max", type=float, default=6.0)
     p.add_argument("--grid_points", type=int, default=2001)
     p.add_argument("--eval_timesteps", default="auto",
                    help="'auto', 'all', or comma/space-separated timestep indices such as '0,5,10,19'.")
@@ -235,17 +251,25 @@ def math_sqrt_max(x: float, floor: float) -> float:
 
 
 def np_x0_hat(x, weights, means, stds, schedule, t_idx: int):
+    x = np.asarray(x, dtype=np.float64)
     sqrt_ab = float(np.asarray(schedule.sqrt_alphas_cumprod)[t_idx])
     sigma = float(np.asarray(schedule.sqrt_one_minus_alphas_cumprod)[t_idx])
-    score = np_base_score(x, weights, means, stds, schedule, t_idx)
-    return (np.asarray(x) + sigma ** 2 * score) / sqrt_ab
+    loc = sqrt_ab * means
+    var = (sqrt_ab ** 2) * (stds ** 2) + sigma ** 2
+    log_comp = (
+        np.log(weights)[None, :]
+        - 0.5 * (np.log(2.0 * np.pi * var)[None, :] + (x[:, None] - loc[None, :]) ** 2 / var[None, :])
+    )
+    resp = np.exp(log_comp - _np_logsumexp(log_comp, axis=-1)[:, None])
+    posterior_mean = means[None, :] + (sqrt_ab * stds[None, :] ** 2 / var[None, :]) * (x[:, None] - loc[None, :])
+    return np.sum(resp * posterior_mean, axis=-1)
 
 
 def normalized_density_on_grid(log_unnorm, grid):
     log_unnorm = np.asarray(log_unnorm, dtype=np.float64)
     shifted = log_unnorm - np.max(log_unnorm)
     dens = np.exp(shifted)
-    z = np.trapz(dens, grid)
+    z = integrate_trapezoid(dens, grid)
     if not np.isfinite(z) or z <= 0:
         raise ValueError("Invalid density normalization constant.")
     return dens / z
@@ -288,14 +312,14 @@ def metrics_from_samples(samples, grid, target_dens, cfg: ToyConfig, *,
     emp_cdf = emp_cdf / max(emp_cdf[-1], 1.0)
     target_cdf_mid = np.interp(mids, grid, target_cdf)
     ks = float(np.max(np.abs(emp_cdf - target_cdf_mid)))
-    w1 = float(np.trapz(np.abs(emp_cdf - target_cdf_mid), mids))
+    w1 = float(integrate_trapezoid(np.abs(emp_cdf - target_cdf_mid), mids))
 
     if q_sample_arg is None:
         q_sample_arg = samples
     if q_grid_arg is None:
         q_grid_arg = grid
     q_sample = float(np.mean(np_reward(q_sample_arg, cfg.reward_center, cfg.reward_scale)))
-    q_target = float(np.trapz(np_reward(q_grid_arg, cfg.reward_center, cfg.reward_scale) * target_dens, grid))
+    q_target = float(integrate_trapezoid(np_reward(q_grid_arg, cfg.reward_center, cfg.reward_scale) * target_dens, grid))
     return {
         "kl_sample_target": kl_sample_target,
         "js": js,
@@ -321,6 +345,62 @@ def save_density_plot(path, samples, grid, target_dens, title):
     plt.close()
 
 
+def integrate_trapezoid(y, x):
+    if hasattr(np, "trapezoid"):
+        return np.trapezoid(y, x)
+    return np.trapz(y, x)
+
+
+def save_density_panel(path, panels, title):
+    n = len(panels)
+    cols = min(3, n)
+    rows = int(np.ceil(n / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(4.8 * cols, 3.6 * rows), squeeze=False)
+    for ax in axes.ravel()[n:]:
+        ax.axis("off")
+    for ax, panel in zip(axes.ravel(), panels):
+        samples = panel["samples"]
+        grid = panel["grid"]
+        target_dens = panel["target_dens"]
+        ax.hist(samples, bins=80, density=True, alpha=0.38, label="samples")
+        ax.plot(grid, target_dens, lw=1.8, label="target")
+        subtitle = (
+            f"{panel['label']}\n"
+            f"W1={panel['w1']:.4f}, KS={panel['ks']:.4f}, JS={panel['js']:.4f}, acc={panel['acc']:.3f}"
+        )
+        ax.set_title(subtitle, fontsize=10)
+        ax.set_xlabel("x")
+        ax.set_ylabel("density")
+    axes.ravel()[0].legend(loc="best", fontsize=9)
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
+def make_eval_grid(samples, cfg: ToyConfig, weights, means, stds, schedule, t_idx: int | None):
+    if cfg.grid_mode == "fixed":
+        return np.linspace(cfg.grid_min, cfg.grid_max, cfg.grid_points, dtype=np.float64)
+
+    samples = np.asarray(samples, dtype=np.float64)
+    if t_idx is None:
+        loc = means
+        sd = stds
+    else:
+        sqrt_ab = float(np.asarray(schedule.sqrt_alphas_cumprod)[t_idx])
+        sigma = float(np.asarray(schedule.sqrt_one_minus_alphas_cumprod)[t_idx])
+        loc = sqrt_ab * means
+        sd = np.sqrt((sqrt_ab ** 2) * (stds ** 2) + sigma ** 2)
+
+    base_low = float(np.min(loc - 6.0 * sd))
+    base_high = float(np.max(loc + 6.0 * sd))
+    sample_low, sample_high = np.quantile(samples, [0.001, 0.999])
+    low = min(base_low, float(sample_low), cfg.grid_min)
+    high = max(base_high, float(sample_high), cfg.grid_max)
+    margin = max(0.05 * (high - low), 1e-3)
+    return np.linspace(low - margin, high + margin, cfg.grid_points, dtype=np.float64)
+
+
 def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> ToySamplerResult:
     """Run a self-contained 1D traceable variant of the project's MALA sampler."""
     schedule = model.schedule
@@ -338,17 +418,18 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
         return model.q(None, None, x0_clipped)
 
+    def base_x0_hat(x_in, t_idx):
+        return model.x0_hat_from_xt(x_in, t_idx)
+
     def energy_total(t_idx, x):
         E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(None, None, a, t_idx), x)
         (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
-        noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
-        x0_hat = reconstruct_x0_from_noise(x, t_idx, noise_pred)
+        x0_hat = base_x0_hat(x, t_idx)
         clip_frac = jnp.mean((jnp.abs(x0_hat) > cfg.x0_hat_clip_radius).astype(jnp.float32))
         return jnp.float32(cfg.alpha) * E_vals - beta_current * q_at_clipped_x0_hat(x0_hat), clip_frac
 
     def guidance_value_from_x(x_in, t_idx):
-        eps_pred = model.eps_pred(None, None, x_in, t_idx)
-        x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
+        x0_hat = base_x0_hat(x_in, t_idx)
         q = q_at_clipped_x0_hat(x0_hat)
         return jnp.float32(cfg.guidance_strength_multiplier) * reduce_over_batch(q)
 
@@ -356,8 +437,7 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         if cfg.guidance_gradient_space == "xt":
             return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
 
-        eps_pred = model.eps_pred(None, None, x_in, t_idx)
-        x0_hat = reconstruct_x0_from_noise(x_in, t_idx, eps_pred)
+        x0_hat = base_x0_hat(x_in, t_idx)
         if cfg.guidance_gradient_space == "x0hat":
             return jax.grad(
                 lambda x0: jnp.float32(cfg.guidance_strength_multiplier) * reduce_over_batch(
@@ -375,8 +455,7 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
     def jacobian_free_energy_and_drift(t_idx, x):
         E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(None, None, a, t_idx), x)
         (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
-        noise_pred = schedule.sqrt_one_minus_alphas_cumprod[t_idx] * e_grad
-        x0_hat = reconstruct_x0_from_noise(x, t_idx, noise_pred)
+        x0_hat = base_x0_hat(x, t_idx)
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
         q = model.q(None, None, x0_clipped)
         if cfg.guidance_gradient_space == "x0hat":
@@ -557,6 +636,7 @@ def main() -> None:
         batch_independent_guidance=args.batch_independent_guidance,
         advantage_normalization=args.advantage_normalization,
         initial_advantage_second_moment_ema=args.initial_advantage_second_moment_ema,
+        grid_mode=args.grid_mode,
         grid_min=args.grid_min,
         grid_max=args.grid_max,
         grid_points=args.grid_points,
@@ -598,9 +678,10 @@ def main() -> None:
     trace = np.asarray(result.trace[:, :, 0])
     raw_x0 = np.asarray(result.raw_x0[:, 0])
     eval_ts = _eval_timesteps(cfg.eval_timesteps, cfg.diffusion_steps)
-    grid = np.linspace(cfg.grid_min, cfg.grid_max, cfg.grid_points, dtype=np.float64)
 
     rows = []
+    panels = []
+    grid = make_eval_grid(raw_x0, cfg, weights, means, stds, schedule, None)
     final_target = target_density(grid, cfg, weights, means, stds, schedule, None)
     final_metrics = metrics_from_samples(raw_x0, grid, final_target, cfg)
     final_metrics.update({
@@ -610,6 +691,16 @@ def main() -> None:
         "clip_fraction": float(np.asarray(result.per_level_clip)[0]),
     })
     rows.append(final_metrics)
+    panels.append({
+        "label": "final clean",
+        "samples": raw_x0,
+        "grid": grid,
+        "target_dens": final_target,
+        "w1": final_metrics["w1"],
+        "ks": final_metrics["ks"],
+        "js": final_metrics["js"],
+        "acc": final_metrics["acceptance_rate"],
+    })
     save_density_plot(out / "plots" / "final_clean_density.png", raw_x0, grid, final_target,
                       "final raw x0 vs clean target")
 
@@ -623,6 +714,7 @@ def main() -> None:
     rows.append(clipped_metrics)
 
     for t in eval_ts:
+        grid = make_eval_grid(trace[t], cfg, weights, means, stds, schedule, t)
         dens = target_density(grid, cfg, weights, means, stds, schedule, t)
         sample_x0_hat = np_x0_hat(trace[t], weights, means, stds, schedule, t)
         grid_x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t)
@@ -640,8 +732,26 @@ def main() -> None:
             "clip_fraction": float(np.asarray(result.per_level_clip)[t]),
         })
         rows.append(metrics)
+        panels.append({
+            "label": f"intermediate t={t}",
+            "samples": trace[t],
+            "grid": grid,
+            "target_dens": dens,
+            "w1": metrics["w1"],
+            "ks": metrics["ks"],
+            "js": metrics["js"],
+            "acc": metrics["acceptance_rate"],
+        })
         save_density_plot(out / "plots" / f"intermediate_t{t:03d}_density.png", trace[t], grid, dens,
                           f"post-MALA x_t at t={t} vs E_total target")
+    save_density_panel(
+        out / "plots" / "density_panel.png",
+        panels,
+        (
+            f"mala_steps={cfg.mala_steps}, gradient={cfg.guidance_gradient_space}, "
+            f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
+        ),
+    )
 
     np.savez_compressed(
         out / "samples.npz",
@@ -652,7 +762,7 @@ def main() -> None:
         per_level_acc=np.asarray(result.per_level_acc),
         per_level_clip=np.asarray(result.per_level_clip),
         log_eta_scales=np.asarray(result.log_eta_scales),
-        grid=grid,
+        grid=make_eval_grid(raw_x0, cfg, weights, means, stds, schedule, None),
     )
 
     fieldnames = [

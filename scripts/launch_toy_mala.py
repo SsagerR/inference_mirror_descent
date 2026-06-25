@@ -9,6 +9,7 @@ simple Cartesian CLI ablations for smoke tests and toy sweeps.
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import os
 import re
@@ -43,11 +44,13 @@ export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:/usr/lib/nvidia:/lib64:${{LD
 export CPATH="$HOME/.local/glew/glew-2.1.0/include:${{CPATH:-}}"
 export PYTHONPATH="{project_dir}:${{PYTHONPATH:-}}"
 export ZSCRATCH="${{ZSCRATCH:-/n/netscratch/kdbrantley_lab/Lab/$USER}}"
+export TOY_MALA_RUN_DIR="${{ZSCRATCH}}/runs/toy_mala/{job_name}_${{SLURM_JOB_ID}}"
 
 echo "Job ID: $SLURM_JOB_ID"
 echo "Node: $(hostname)"
 echo "Python: $(which python)"
 echo "Command: {cmd}"
+echo "Toy MALA run dir: $TOY_MALA_RUN_DIR"
 echo "Started: $(date)"
 nvidia-smi || true
 
@@ -148,10 +151,12 @@ def main():
     base_cmd = normalize_cmd(args.cmd)
     jobs = build_jobs(base_cmd, args.ablate)
     requeue_directives = "#SBATCH --requeue\n#SBATCH --signal=B:SIGTERM@120" if args.requeue else ""
+    manifest_rows = []
 
     submitted = 0
     for idx, (cmd, desc) in enumerate(jobs):
         job_name = safe_name(f"{args.job_name}_{idx}_{desc}" if len(jobs) > 1 else args.job_name)
+        cmd_for_script = cmd.replace("@RUN_DIR@", "$TOY_MALA_RUN_DIR")
         script = SBATCH_TEMPLATE.format(
             job_name=job_name,
             account=args.account,
@@ -162,7 +167,7 @@ def main():
             time=args.time,
             log_dir=log_dir,
             project_dir=project_dir,
-            cmd=cmd,
+            cmd=cmd_for_script,
             requeue_directives=requeue_directives,
         )
         script_path = log_dir / f"{job_name}.sbatch"
@@ -171,20 +176,57 @@ def main():
             print(f"  job_name: {job_name}")
             print(f"  command: {cmd}")
             print()
+            manifest_rows.append({
+                "index": idx,
+                "desc": desc,
+                "job_name": job_name,
+                "job_id": "",
+                "command": cmd_for_script,
+                "output_dir_pattern": f"$ZSCRATCH/runs/toy_mala/{job_name}_${{SLURM_JOB_ID}}",
+                "sbatch_script": str(script_path),
+                "status": "dry_run",
+            })
             continue
         script_path.write_text(script)
         result = subprocess.run(["sbatch", str(script_path)], text=True, capture_output=True)
         if result.returncode == 0:
-            print(f"[{idx + 1}/{len(jobs)}] {desc}: {result.stdout.strip()}")
+            stdout = result.stdout.strip()
+            job_id = stdout.split()[-1] if stdout.startswith("Submitted batch job ") else ""
+            print(f"[{idx + 1}/{len(jobs)}] {desc}: {stdout}")
             submitted += 1
+            status = "submitted"
         else:
             print(f"[{idx + 1}/{len(jobs)}] {desc}: FAILED")
             print(result.stderr.strip())
+            job_id = ""
+            status = "failed"
+        manifest_rows.append({
+            "index": idx,
+            "desc": desc,
+            "job_name": job_name,
+            "job_id": job_id,
+            "command": cmd_for_script,
+            "output_dir_pattern": f"$ZSCRATCH/runs/toy_mala/{job_name}_${{SLURM_JOB_ID}}",
+            "sbatch_script": str(script_path),
+            "status": status,
+        })
 
     if args.dry_run:
         print(f"Dry run generated {len(jobs)} job(s). Logs would go to: {log_dir}")
     else:
+        manifest_path = log_dir / "launch_manifest.csv"
+        with open(manifest_path, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "index", "desc", "job_name", "job_id", "command",
+                    "output_dir_pattern", "sbatch_script", "status",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(manifest_rows)
         print(f"Submitted {submitted}/{len(jobs)} job(s). Logs: {log_dir}")
+        print(f"Launch manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
