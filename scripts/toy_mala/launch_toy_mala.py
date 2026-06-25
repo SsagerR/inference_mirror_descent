@@ -137,7 +137,7 @@ def build_jobs(base_cmd: str, ablations):
 
 def main():
     args = parse_args()
-    project_dir = Path(__file__).parent.parent.resolve()
+    project_dir = Path(__file__).resolve().parents[2]
     partition = args.partition or ("kempner_requeue" if args.requeue else "kempner_h100")
     if args.log_dir:
         log_dir = Path(args.log_dir).expanduser()

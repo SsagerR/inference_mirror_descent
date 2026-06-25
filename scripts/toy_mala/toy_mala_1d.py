@@ -45,6 +45,7 @@ class ToyConfig:
     mala_steps: int
     denoising_predictor: str
     guidance_gradient_space: str
+    x0_hat_method: str
     x0_hat_clip_radius: float
     x_recon_clip_radius: float
     mala_adapt_rate: float
@@ -162,6 +163,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mala_steps", type=int, default=4)
     p.add_argument("--denoising_predictor", choices=["Identity", "DDPM_mean", "DDIM"], default="DDPM_mean")
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
+    p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="posterior_mean",
+                   help="Oracle posterior mean is stable; tweedie uses the standard epsilon-reconstruction formula.")
     p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
     p.add_argument("--x_recon_clip_radius", type=float, default=1.0,
                    help="DDPM_mean clean reconstruction clip radius. Default 1.0 matches train_setup.py.")
@@ -253,7 +256,7 @@ def math_sqrt_max(x: float, floor: float) -> float:
     return float(np.sqrt(max(float(x), float(floor))))
 
 
-def np_x0_hat(x, weights, means, stds, schedule, t_idx: int):
+def np_x0_hat(x, weights, means, stds, schedule, t_idx: int, method: str = "posterior_mean"):
     x = np.asarray(x, dtype=np.float64)
     sqrt_ab = float(np.asarray(schedule.sqrt_alphas_cumprod)[t_idx])
     sigma = float(np.asarray(schedule.sqrt_one_minus_alphas_cumprod)[t_idx])
@@ -264,6 +267,11 @@ def np_x0_hat(x, weights, means, stds, schedule, t_idx: int):
         - 0.5 * (np.log(2.0 * np.pi * var)[None, :] + (x[:, None] - loc[None, :]) ** 2 / var[None, :])
     )
     resp = np.exp(log_comp - _np_logsumexp(log_comp, axis=-1)[:, None])
+    score = np.sum(resp * (-(x[:, None] - loc[None, :]) / var[None, :]), axis=-1)
+    if method == "tweedie":
+        return (x + sigma * sigma * score) / sqrt_ab
+    if method != "posterior_mean":
+        raise ValueError(f"Unknown x0_hat_method: {method}")
     posterior_mean = means[None, :] + (sqrt_ab * stds[None, :] ** 2 / var[None, :]) * (x[:, None] - loc[None, :])
     return np.sum(resp * posterior_mean, axis=-1)
 
@@ -284,7 +292,7 @@ def target_density(grid, cfg: ToyConfig, weights, means, stds, schedule, t_idx: 
         q_arg = grid
     else:
         base_log = np_base_logpdf(grid, weights, means, stds, schedule, t_idx)
-        x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t_idx)
+        x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t_idx, cfg.x0_hat_method)
         r = cfg.x0_hat_clip_radius
         q_arg = np.clip(x0_hat, -r, r) if np.isfinite(r) else x0_hat
     log_unnorm = cfg.alpha * base_log + effective_beta(cfg) * np_reward(q_arg, cfg.reward_center, cfg.reward_scale)
@@ -422,7 +430,11 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         return model.q(None, None, x0_clipped)
 
     def base_x0_hat(x_in, t_idx):
-        return model.x0_hat_from_xt(x_in, t_idx)
+        if cfg.x0_hat_method == "posterior_mean":
+            return model.x0_hat_from_xt(x_in, t_idx)
+        if cfg.x0_hat_method == "tweedie":
+            return reconstruct_x0_from_noise(x_in, t_idx, model.eps_pred(None, None, x_in, t_idx))
+        raise ValueError(f"Unknown x0_hat_method: {cfg.x0_hat_method}")
 
     def energy_total(t_idx, x):
         E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(None, None, a, t_idx), x)
@@ -643,6 +655,7 @@ def main() -> None:
         mala_steps=args.mala_steps,
         denoising_predictor=args.denoising_predictor,
         guidance_gradient_space=args.guidance_gradient_space,
+        x0_hat_method=args.x0_hat_method,
         x0_hat_clip_radius=args.x0_hat_clip_radius,
         x_recon_clip_radius=args.x_recon_clip_radius,
         mala_adapt_rate=args.mala_adapt_rate,
@@ -730,8 +743,8 @@ def main() -> None:
     for t in eval_ts:
         grid = make_eval_grid(trace[t], cfg, weights, means, stds, schedule, t)
         dens = target_density(grid, cfg, weights, means, stds, schedule, t)
-        sample_x0_hat = np_x0_hat(trace[t], weights, means, stds, schedule, t)
-        grid_x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t)
+        sample_x0_hat = np_x0_hat(trace[t], weights, means, stds, schedule, t, cfg.x0_hat_method)
+        grid_x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t, cfg.x0_hat_method)
         if np.isfinite(cfg.x0_hat_clip_radius):
             sample_x0_hat = np.clip(sample_x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
             grid_x0_hat = np.clip(grid_x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)

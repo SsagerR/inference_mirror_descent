@@ -28,6 +28,7 @@ KEY_COLUMNS = [
     "mala_steps",
     "guidance_gradient_space",
     "denoising_predictor",
+    "x0_hat_method",
     "beta",
     "alpha",
     "beta_schedule_type",
@@ -37,6 +38,9 @@ KEY_COLUMNS = [
     "x0_hat_clip_radius",
     "x_recon_clip_radius",
     "mala_adapt_rate",
+    "train_steps",
+    "policy_parameterization",
+    "policy_final_layer",
     "seed",
 ]
 
@@ -682,6 +686,7 @@ def main():
             "mala_steps": cfg.mala_steps,
             "guidance_gradient_space": cfg.guidance_gradient_space,
             "denoising_predictor": cfg.denoising_predictor,
+            "x0_hat_method": get_cfg_attr(cfg, "x0_hat_method", "posterior_mean"),
             "beta": cfg.beta,
             "alpha": cfg.alpha,
             "beta_schedule_type": cfg.beta_schedule_type,
@@ -691,6 +696,9 @@ def main():
             "x0_hat_clip_radius": cfg.x0_hat_clip_radius,
             "x_recon_clip_radius": get_cfg_attr(cfg, "x_recon_clip_radius", 1.0),
             "mala_adapt_rate": cfg.mala_adapt_rate,
+            "train_steps": get_cfg_attr(cfg, "train_steps", ""),
+            "policy_parameterization": get_cfg_attr(cfg, "policy_parameterization", ""),
+            "policy_final_layer": get_cfg_attr(cfg, "policy_final_layer", ""),
             "seed": cfg.seed,
         }
         manifest_rows.append(prefix)

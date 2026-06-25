@@ -46,6 +46,7 @@ class Toy2DConfig:
     mala_steps: int
     denoising_predictor: str
     guidance_gradient_space: str
+    x0_hat_method: str
     x0_hat_clip_radius: float
     x_recon_clip_radius: float
     mala_adapt_rate: float
@@ -181,6 +182,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mala_steps", type=int, default=4)
     p.add_argument("--denoising_predictor", choices=["Identity", "DDPM_mean", "DDIM"], default="DDPM_mean")
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
+    p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="posterior_mean",
+                   help="Oracle posterior mean is stable; tweedie uses the standard epsilon-reconstruction formula.")
     p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
     p.add_argument("--x_recon_clip_radius", type=float, default=1.0)
     p.add_argument("--mala_adapt_rate", type=float, default=0.2)
@@ -268,15 +271,22 @@ def np_base_logpdf(points, weights, means, covs, schedule, t_idx: int | None):
     return np_logsumexp(log_comp, axis=-1)
 
 
-def np_x0_hat(points, weights, means, covs, schedule, t_idx: int):
+def np_x0_hat(points, weights, means, covs, schedule, t_idx: int, method: str = "posterior_mean"):
     points = np.asarray(points, dtype=np.float64)
     c = float(np.asarray(schedule.sqrt_alphas_cumprod)[t_idx])
+    sigma = float(np.asarray(schedule.sqrt_one_minus_alphas_cumprod)[t_idx])
     loc, cov_t = np_component_params(covs, means, schedule, t_idx)
     inv_cov_t = np.linalg.inv(cov_t)
     log_comp = np_base_component_logpdf(points, weights, loc, cov_t, inv_cov_t)
     resp = np.exp(log_comp - np_logsumexp(log_comp, axis=-1)[:, None])
-    gains = c * np.einsum("kij,kjl->kil", covs, inv_cov_t)
     diff = points[:, None, :] - loc[None, :, :]
+    component_scores = -np.einsum("kij,nkj->nki", inv_cov_t, diff)
+    score = np.sum(resp[:, :, None] * component_scores, axis=1)
+    if method == "tweedie":
+        return (points + sigma * sigma * score) / c
+    if method != "posterior_mean":
+        raise ValueError(f"Unknown x0_hat_method: {method}")
+    gains = c * np.einsum("kij,kjl->kil", covs, inv_cov_t)
     cond_mean = means[None, :, :] + np.einsum("kij,nkj->nki", gains, diff)
     return np.sum(resp[:, :, None] * cond_mean, axis=1)
 
@@ -313,7 +323,7 @@ def target_density_grid(grid_x, grid_y, cfg, weights, means, covs, schedule, t_i
     if t_idx is None:
         q_arg = points
     else:
-        q_arg = np_x0_hat(points, weights, means, covs, schedule, t_idx)
+        q_arg = np_x0_hat(points, weights, means, covs, schedule, t_idx, cfg.x0_hat_method)
         if np.isfinite(cfg.x0_hat_clip_radius):
             q_arg = np.clip(q_arg, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
     log_unnorm = cfg.alpha * base_log + effective_beta(cfg) * np_reward(
@@ -487,8 +497,18 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
         return model.q(None, None, x0_clipped)
 
+    def reconstruct_x0_from_noise(x_in, t_idx, noise_pred):
+        return (
+            x_in * schedule.sqrt_recip_alphas_cumprod[t_idx]
+            - noise_pred * schedule.sqrt_recipm1_alphas_cumprod[t_idx]
+        )
+
     def base_x0_hat(x_in, t_idx):
-        return model.x0_hat_from_xt(x_in, t_idx)
+        if cfg.x0_hat_method == "posterior_mean":
+            return model.x0_hat_from_xt(x_in, t_idx)
+        if cfg.x0_hat_method == "tweedie":
+            return reconstruct_x0_from_noise(x_in, t_idx, model.eps_pred(None, None, x_in, t_idx))
+        raise ValueError(f"Unknown x0_hat_method: {cfg.x0_hat_method}")
 
     def energy_total(t_idx, x):
         E_vals, vjp_fn = jax.vjp(lambda a: model.energy_fn(None, None, a, t_idx), x)
@@ -677,6 +697,7 @@ def main() -> None:
         mala_steps=args.mala_steps,
         denoising_predictor=args.denoising_predictor,
         guidance_gradient_space=args.guidance_gradient_space,
+        x0_hat_method=args.x0_hat_method,
         x0_hat_clip_radius=args.x0_hat_clip_radius,
         x_recon_clip_radius=args.x_recon_clip_radius,
         mala_adapt_rate=args.mala_adapt_rate,
@@ -771,12 +792,12 @@ def main() -> None:
         samples_t = trace[t]
         grid_x, grid_y = make_eval_grid(samples_t, cfg, means, covs, schedule, t)
         dens = target_density_grid(grid_x, grid_y, cfg, weights, means, covs, schedule, t)
-        sample_x0_hat = np_x0_hat(samples_t, weights, means, covs, schedule, t)
+        sample_x0_hat = np_x0_hat(samples_t, weights, means, covs, schedule, t, cfg.x0_hat_method)
         if np.isfinite(cfg.x0_hat_clip_radius):
             sample_x0_hat = np.clip(sample_x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
 
         def target_x0_hat(points, t_idx=t):
-            x0_hat = np_x0_hat(points, weights, means, covs, schedule, t_idx)
+            x0_hat = np_x0_hat(points, weights, means, covs, schedule, t_idx, cfg.x0_hat_method)
             if np.isfinite(cfg.x0_hat_clip_radius):
                 x0_hat = np.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
             return x0_hat
