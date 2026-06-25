@@ -477,25 +477,35 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
         return noise_pred_scaled - beta_current * sigma_t * grad_q
 
+    def guided_x0_and_eps(t_idx, x_in):
+        eps_base = model.eps_pred(None, None, x_in, t_idx)
+        grad_q = compute_guidance_gradient(x_in, t_idx)
+        sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
+        sqrt_ab_t = schedule.sqrt_alphas_cumprod[t_idx]
+        eps_guided = jnp.float32(cfg.alpha) * eps_base - beta_current * sigma_t * grad_q
+        # Algebraically equal to reconstruct_x0_from_noise(x, t, eps_guided),
+        # but uses the closed-form oracle E[x0 | x_t] to avoid high-noise cancellation.
+        x0_guided = (
+            jnp.float32(cfg.alpha) * base_x0_hat(x_in, t_idx)
+            + (jnp.float32(1.0) - jnp.float32(cfg.alpha)) * x_in / sqrt_ab_t
+            + beta_current * (sigma_t * sigma_t / sqrt_ab_t) * grad_q
+        )
+        return x0_guided, eps_guided
+
     def ddpm_mean_step(t_idx, x_in):
-        eps_pred = guided_eps_pred(t_idx, x_in)
+        x0_guided, _eps_pred = guided_x0_and_eps(t_idx, x_in)
         x0_hat = jnp.clip(
-            reconstruct_x0_from_noise(x_in, t_idx, eps_pred),
+            x0_guided,
             -model.x_recon_clip_radius,
             model.x_recon_clip_radius,
         )
         return x0_hat * schedule.posterior_mean_coef1[t_idx] + x_in * schedule.posterior_mean_coef2[t_idx]
 
     def ddim_step(t_idx, x_in):
-        eps_pred = guided_eps_pred(t_idx, x_in)
-        sqrt_ab_t = schedule.sqrt_alphas_cumprod[t_idx]
-        sqrt_one_minus_ab_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
+        x0_guided, eps_pred = guided_x0_and_eps(t_idx, x_in)
         sqrt_ab_prev = jnp.sqrt(schedule.alphas_cumprod_prev[t_idx])
         sqrt_one_minus_ab_prev = jnp.sqrt(1.0 - schedule.alphas_cumprod_prev[t_idx])
-        return (
-            (sqrt_ab_prev / sqrt_ab_t) * x_in
-            + (sqrt_one_minus_ab_prev - (sqrt_ab_prev / sqrt_ab_t) * sqrt_one_minus_ab_t) * eps_pred
-        )
+        return sqrt_ab_prev * x0_guided + sqrt_one_minus_ab_prev * eps_pred
 
     if cfg.denoising_predictor == "Identity":
         def denoising_step(t_idx, x_curr):
