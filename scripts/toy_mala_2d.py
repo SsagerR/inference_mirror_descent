@@ -378,7 +378,16 @@ def marginal_ks(samples, target_samples, dim: int):
     return float(np.max(np.abs(fa - fb)))
 
 
-def metrics_from_samples(samples, grid_x, grid_y, target_dens, cfg, rng, q_sample_arg=None):
+def metrics_from_samples(
+    samples,
+    grid_x,
+    grid_y,
+    target_dens,
+    cfg,
+    rng,
+    q_sample_arg=None,
+    q_target_transform=None,
+):
     samples = np.asarray(samples, dtype=np.float64)
     hist, x_edges, y_edges = np.histogram2d(samples[:, 0], samples[:, 1], bins=[grid_x, grid_y])
     p = hist.T.astype(np.float64)
@@ -404,9 +413,10 @@ def metrics_from_samples(samples, grid_x, grid_y, target_dens, cfg, rng, q_sampl
     ks_y = marginal_ks(samples, target_samples, 1)
     if q_sample_arg is None:
         q_sample_arg = samples
+    q_target_arg = target_samples if q_target_transform is None else q_target_transform(target_samples)
     q_sample = float(np.mean(np_reward(q_sample_arg, np.asarray(cfg.reward_center), np.asarray(cfg.reward_scales))))
     q_target = float(
-        np.mean(np_reward(target_samples, np.asarray(cfg.reward_center), np.asarray(cfg.reward_scales)))
+        np.mean(np_reward(q_target_arg, np.asarray(cfg.reward_center), np.asarray(cfg.reward_scales)))
     )
     return {
         "kl_sample_target": kl_sample_target,
@@ -764,7 +774,23 @@ def main() -> None:
         sample_x0_hat = np_x0_hat(samples_t, weights, means, covs, schedule, t)
         if np.isfinite(cfg.x0_hat_clip_radius):
             sample_x0_hat = np.clip(sample_x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
-        metrics = metrics_from_samples(samples_t, grid_x, grid_y, dens, cfg, rng, q_sample_arg=sample_x0_hat)
+
+        def target_x0_hat(points, t_idx=t):
+            x0_hat = np_x0_hat(points, weights, means, covs, schedule, t_idx)
+            if np.isfinite(cfg.x0_hat_clip_radius):
+                x0_hat = np.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
+            return x0_hat
+
+        metrics = metrics_from_samples(
+            samples_t,
+            grid_x,
+            grid_y,
+            dens,
+            cfg,
+            rng,
+            q_sample_arg=sample_x0_hat,
+            q_target_transform=target_x0_hat,
+        )
         metrics.update(
             {
                 "stage": "intermediate",
