@@ -30,10 +30,13 @@ KEY_COLUMNS = [
     "denoising_predictor",
     "beta",
     "alpha",
+    "beta_schedule_type",
+    "snr_max",
     "num_samples",
     "diffusion_steps",
     "x0_hat_clip_radius",
     "x_recon_clip_radius",
+    "mala_adapt_rate",
     "seed",
 ]
 
@@ -86,6 +89,98 @@ def parse_args():
 def load_cfg(path: Path):
     data = json.loads(path.read_text())
     return SimpleNamespace(**data)
+
+
+def cfg_to_dict(cfg) -> dict:
+    return dict(vars(cfg))
+
+
+def value_key(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def unique_values(values: list):
+    seen = {}
+    for value in values:
+        seen.setdefault(value_key(value), value)
+    return [seen[k] for k in sorted(seen)]
+
+
+def split_fixed_and_swept(configs: list[dict]) -> tuple[dict, dict]:
+    keys = sorted({key for cfg in configs for key in cfg})
+    fixed = {}
+    swept = {}
+    for key in keys:
+        values = [cfg.get(key) for cfg in configs]
+        uniques = unique_values(values)
+        if len(uniques) == 1:
+            fixed[key] = uniques[0]
+        else:
+            swept[key] = uniques
+    return fixed, swept
+
+
+def write_experiment_metadata(
+    out_dir: Path,
+    *,
+    args,
+    configs: list[dict],
+    run_dirs: list[Path],
+    heatmap_metrics: list[str],
+    manifest_path: Path,
+    summary_path: Path,
+    panel_dir: Path,
+    heatmap_dir: Path,
+    heatmap_count: int,
+) -> tuple[Path, Path]:
+    fixed, swept = split_fixed_and_swept(configs)
+    metadata = {
+        "num_runs": len(run_dirs),
+        "runs_file": str(args.runs_file) if args.runs_file is not None else None,
+        "runs_root": str(args.runs_root),
+        "match": args.match,
+        "expected_runs": args.expected_runs,
+        "heatmap_metrics": heatmap_metrics,
+        "fixed_parameters": fixed,
+        "swept_parameters": swept,
+        "outputs": {
+            "run_manifest": str(manifest_path),
+            "sweep_metrics": str(summary_path),
+            "panels": str(panel_dir),
+            "heatmaps": str(heatmap_dir),
+            "heatmap_count": heatmap_count,
+        },
+        "run_dirs": [str(p) for p in run_dirs],
+    }
+
+    json_path = out_dir / "experiment_config.json"
+    json_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
+
+    md_path = out_dir / "README.md"
+    lines = [
+        "# Toy MALA Summary",
+        "",
+        f"- Runs summarized: {len(run_dirs)}",
+        f"- Runs file: `{metadata['runs_file']}`",
+        f"- Sweep metrics: `{summary_path.name}`",
+        f"- Run manifest: `{manifest_path.name}`",
+        f"- Panels: `{panel_dir.name}/`",
+        f"- Heatmaps: `{heatmap_dir.name}/` ({heatmap_count} files)",
+        "",
+        "## Swept Parameters",
+        "",
+    ]
+    if swept:
+        for key, values in swept.items():
+            lines.append(f"- `{key}`: `{json.dumps(values, sort_keys=True)}`")
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Fixed Parameters", ""])
+    for key, value in fixed.items():
+        lines.append(f"- `{key}`: `{json.dumps(value, sort_keys=True)}`")
+    lines.append("")
+    md_path.write_text("\n".join(lines))
+    return json_path, md_path
 
 
 def discover_runs(args) -> list[Path]:
@@ -565,8 +660,10 @@ def main():
 
     all_rows = []
     manifest_rows = []
+    configs = []
     for run_dir in runs:
         cfg = load_cfg(run_dir / "config.json")
+        configs.append(cfg_to_dict(cfg))
         metrics_path = run_dir / "metrics.csv"
         if args.overwrite_metrics or not metrics_path.exists() or not (run_dir / "plots" / "density_panel.png").exists():
             rows = recompute_metrics_and_panels(run_dir, cfg)
@@ -587,10 +684,13 @@ def main():
             "denoising_predictor": cfg.denoising_predictor,
             "beta": cfg.beta,
             "alpha": cfg.alpha,
+            "beta_schedule_type": cfg.beta_schedule_type,
+            "snr_max": cfg.snr_max,
             "num_samples": cfg.num_samples,
             "diffusion_steps": cfg.diffusion_steps,
             "x0_hat_clip_radius": cfg.x0_hat_clip_radius,
             "x_recon_clip_radius": get_cfg_attr(cfg, "x_recon_clip_radius", 1.0),
+            "mala_adapt_rate": cfg.mala_adapt_rate,
             "seed": cfg.seed,
         }
         manifest_rows.append(prefix)
@@ -612,11 +712,26 @@ def main():
             writer.writerow({k: row.get(k, "") for k in KEY_COLUMNS + METRIC_COLUMNS})
 
     heatmap_count = save_all_heatmaps(all_rows, args.out_dir, heatmap_metrics)
+    heatmap_dir = args.out_dir / "heatmaps"
+    config_path, readme_path = write_experiment_metadata(
+        args.out_dir,
+        args=args,
+        configs=configs,
+        run_dirs=runs,
+        heatmap_metrics=heatmap_metrics,
+        manifest_path=manifest_path,
+        summary_path=summary_path,
+        panel_dir=panel_dir,
+        heatmap_dir=heatmap_dir,
+        heatmap_count=heatmap_count,
+    )
     print(f"runs summarized: {len(runs)}")
+    print(f"experiment config: {config_path}")
+    print(f"experiment readme: {readme_path}")
     print(f"run manifest: {manifest_path}")
     print(f"summary table: {summary_path}")
     print(f"panel images: {panel_dir}")
-    print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
+    print(f"heatmap images: {heatmap_dir} ({heatmap_count} files)")
 
 
 if __name__ == "__main__":
