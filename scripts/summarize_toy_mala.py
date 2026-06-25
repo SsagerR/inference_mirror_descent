@@ -33,6 +33,7 @@ KEY_COLUMNS = [
     "num_samples",
     "diffusion_steps",
     "x0_hat_clip_radius",
+    "x_recon_clip_radius",
     "seed",
 ]
 
@@ -589,6 +590,7 @@ def main():
             "num_samples": cfg.num_samples,
             "diffusion_steps": cfg.diffusion_steps,
             "x0_hat_clip_radius": cfg.x0_hat_clip_radius,
+            "x_recon_clip_radius": get_cfg_attr(cfg, "x_recon_clip_radius", 1.0),
             "seed": cfg.seed,
         }
         manifest_rows.append(prefix)
