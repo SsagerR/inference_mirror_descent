@@ -29,12 +29,21 @@ from relax.utils.diffusion import build_beta_schedule
 
 @dataclass(frozen=True)
 class ToyConfig:
+    target_preset: str
     gmm_weights: list[float]
     gmm_means: list[float]
     gmm_stds: list[float]
     reward_type: str
     reward_center: float
     reward_scale: float
+    reward_bump_centers: list[float]
+    reward_bump_widths: list[float]
+    reward_bump_weights: list[float]
+    reward_sin_amp: float
+    reward_sin_freq: float
+    reward_sin_phase: float
+    reward_l2: float
+    reward_l4: float
     num_samples: int
     seed: int
     diffusion_steps: int
@@ -42,7 +51,11 @@ class ToyConfig:
     snr_max: float
     alpha: float
     beta: float
+    sampler: str
     mala_steps: int
+    mala_eta: float
+    langevin_steps: int
+    langevin_eta: float
     denoising_predictor: str
     guidance_gradient_space: str
     x0_hat_method: str
@@ -144,14 +157,74 @@ def _parse_float_list(text: str) -> list[float]:
     return [float(x) for x in text.replace(",", " ").split()]
 
 
+def _apply_target_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if args.target_preset == "manual":
+        return args
+    if args.target_preset not in {"complex_1d_v1", "complex_1d_v2"}:
+        raise ValueError(f"Unknown target_preset: {args.target_preset}")
+    args.gmm_weights = "0.07,0.18,0.11,0.24,0.08,0.19,0.13"
+    args.gmm_means = "-1.25,-0.82,-0.46,-0.08,0.22,0.61,1.05"
+    args.gmm_stds = "0.055,0.10,0.045,0.15,0.035,0.09,0.06"
+    args.reward_type = "rugged"
+    if args.target_preset == "complex_1d_v1":
+        args.reward_bump_centers = "-1.04,-0.58,-0.19,0.36,0.78,1.12"
+        args.reward_bump_widths = "0.06,0.08,0.05,0.10,0.055,0.08"
+        args.reward_bump_weights = "0.75,-0.65,1.05,0.82,-0.55,0.45"
+        args.reward_sin_amp = 0.16
+        args.reward_sin_freq = 22.0
+        args.reward_sin_phase = 0.35
+        args.reward_l2 = 0.07
+        args.reward_l4 = 0.018
+        return args
+
+    # v2 deliberately rewards low-density valleys and suppresses two high-mass
+    # modes, making pi_target visibly different from pi_orig already at beta=1.
+    args.reward_bump_centers = "-1.04,-0.63,-0.08,0.39,0.61,0.88"
+    args.reward_bump_widths = "0.055,0.055,0.12,0.06,0.10,0.055"
+    args.reward_bump_weights = "3.2,2.4,-3.0,3.0,-2.6,2.8"
+    args.reward_sin_amp = 0.10
+    args.reward_sin_freq = 18.0
+    args.reward_sin_phase = 0.20
+    args.reward_l2 = 0.03
+    args.reward_l4 = 0.01
+    return args
+
+
+def _validate_reward_params(cfg: ToyConfig) -> None:
+    if cfg.reward_type == "quadratic":
+        return
+    n = len(cfg.reward_bump_centers)
+    if not (n == len(cfg.reward_bump_widths) == len(cfg.reward_bump_weights)):
+        raise ValueError("reward_bump_centers, reward_bump_widths, and reward_bump_weights must match.")
+    if n == 0:
+        raise ValueError("Bump/rugged rewards require at least one bump.")
+    if np.any(np.asarray(cfg.reward_bump_widths) <= 0):
+        raise ValueError("reward_bump_widths must be positive.")
+
+
+def _validate_sampler_params(cfg: ToyConfig) -> None:
+    if cfg.sampler in {"dps", "mpgd", "unguided"} and cfg.denoising_predictor != "DDIM":
+        raise ValueError(f"{cfg.sampler} is a DDIM-only reference; set --denoising_predictor DDIM.")
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--target_preset", choices=["manual", "complex_1d_v1", "complex_1d_v2"], default="manual",
+                   help="manual uses provided flags; complex_1d_v2 is the recommended hard 1D target.")
     p.add_argument("--gmm_weights", default="0.35,0.30,0.35")
     p.add_argument("--gmm_means", default="-0.75,0.0,0.75")
     p.add_argument("--gmm_stds", default="0.10,0.16,0.10")
-    p.add_argument("--reward_type", choices=["quadratic"], default="quadratic")
+    p.add_argument("--reward_type", choices=["quadratic", "bumps", "rugged"], default="quadratic")
     p.add_argument("--reward_center", type=float, default=0.45)
     p.add_argument("--reward_scale", type=float, default=1.0)
+    p.add_argument("--reward_bump_centers", default="-0.72,-0.28,0.18,0.64,0.92")
+    p.add_argument("--reward_bump_widths", default="0.055,0.09,0.06,0.12,0.045")
+    p.add_argument("--reward_bump_weights", default="0.85,-0.45,0.75,1.10,-0.35")
+    p.add_argument("--reward_sin_amp", type=float, default=0.12)
+    p.add_argument("--reward_sin_freq", type=float, default=18.0)
+    p.add_argument("--reward_sin_phase", type=float, default=0.4)
+    p.add_argument("--reward_l2", type=float, default=0.08)
+    p.add_argument("--reward_l4", type=float, default=0.02)
     p.add_argument("--num_samples", type=int, default=20000)
     p.add_argument("--seed", type=int, default=0)
 
@@ -160,11 +233,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--snr_max", type=float, default=124.0)
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
+    p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala",
+                   help="Algorithm family: MALA, unadjusted Langevin, or denoising-only DPS/MPGD/unguided.")
     p.add_argument("--mala_steps", type=int, default=4)
+    p.add_argument("--mala_eta", type=float, default=1.0,
+                   help="Initial/fixed MALA step multiplier: eta_t = mala_eta * beta_t when mala_adapt_rate=0.")
+    p.add_argument("--langevin_steps", type=int, default=4)
+    p.add_argument("--langevin_eta", type=float, default=1.0,
+                   help="Fixed Langevin step multiplier: eta_t = langevin_eta * beta_t, clipped to [1e-8, 0.5].")
     p.add_argument("--denoising_predictor", choices=["Identity", "DDPM_mean", "DDIM"], default="DDPM_mean")
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
-    p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="posterior_mean",
-                   help="Oracle posterior mean is stable; tweedie uses the standard epsilon-reconstruction formula.")
+    p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="tweedie",
+                   help="Use tweedie by default: oracle score/epsilon followed by the standard x0 reconstruction formula.")
     p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
     p.add_argument("--x_recon_clip_radius", type=float, default=1.0,
                    help="DDPM_mean clean reconstruction clip radius. Default 1.0 matches train_setup.py.")
@@ -182,7 +262,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--eval_timesteps", default="auto",
                    help="'auto', 'all', or comma/space-separated timestep indices such as '0,5,10,19'.")
     p.add_argument("--output_dir", type=str, required=True)
-    return p.parse_args()
+    return _apply_target_preset(p.parse_args())
 
 
 def _normalize_weights(weights: Iterable[float]) -> np.ndarray:
@@ -241,8 +321,24 @@ def np_base_score(x, weights, means, stds, schedule, t_idx: int):
     return np.sum(resp * (-(x[:, None] - loc[None, :]) / var[None, :]), axis=-1)
 
 
-def np_reward(a, center, scale):
-    return -scale * (np.asarray(a) - center) ** 2
+def np_reward(a, center, scale, cfg: ToyConfig | None = None):
+    a = np.asarray(a, dtype=np.float64)
+    if cfg is None or getattr(cfg, "reward_type", "quadratic") == "quadratic":
+        return -scale * (a - center) ** 2
+
+    centers = np.asarray(cfg.reward_bump_centers, dtype=np.float64)
+    widths = np.asarray(cfg.reward_bump_widths, dtype=np.float64)
+    weights = np.asarray(cfg.reward_bump_weights, dtype=np.float64)
+    bumps = np.sum(
+        weights[None, :] * np.exp(-0.5 * ((a[..., None] - centers[None, :]) / widths[None, :]) ** 2),
+        axis=-1,
+    )
+    penalty = cfg.reward_l2 * a ** 2 + cfg.reward_l4 * a ** 4
+    if cfg.reward_type == "bumps":
+        return bumps - penalty
+    if cfg.reward_type == "rugged":
+        return bumps + cfg.reward_sin_amp * np.sin(cfg.reward_sin_freq * a + cfg.reward_sin_phase) - penalty
+    raise ValueError(f"Unknown reward_type: {cfg.reward_type}")
 
 
 def effective_beta(cfg: ToyConfig) -> float:
@@ -295,7 +391,9 @@ def target_density(grid, cfg: ToyConfig, weights, means, stds, schedule, t_idx: 
         x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t_idx, cfg.x0_hat_method)
         r = cfg.x0_hat_clip_radius
         q_arg = np.clip(x0_hat, -r, r) if np.isfinite(r) else x0_hat
-    log_unnorm = cfg.alpha * base_log + effective_beta(cfg) * np_reward(q_arg, cfg.reward_center, cfg.reward_scale)
+    log_unnorm = cfg.alpha * base_log + effective_beta(cfg) * np_reward(
+        q_arg, cfg.reward_center, cfg.reward_scale, cfg
+    )
     return normalized_density_on_grid(log_unnorm, grid)
 
 
@@ -329,8 +427,11 @@ def metrics_from_samples(samples, grid, target_dens, cfg: ToyConfig, *,
         q_sample_arg = samples
     if q_grid_arg is None:
         q_grid_arg = grid
-    q_sample = float(np.mean(np_reward(q_sample_arg, cfg.reward_center, cfg.reward_scale)))
-    q_target = float(integrate_trapezoid(np_reward(q_grid_arg, cfg.reward_center, cfg.reward_scale) * target_dens, grid))
+    q_sample = float(np.mean(np_reward(q_sample_arg, cfg.reward_center, cfg.reward_scale, cfg)))
+    q_target = float(integrate_trapezoid(
+        np_reward(q_grid_arg, cfg.reward_center, cfg.reward_scale, cfg) * target_dens,
+        grid,
+    ))
     return {
         "kl_sample_target": kl_sample_target,
         "js": js,
@@ -418,6 +519,14 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
     action_shape = (cfg.num_samples, model.act_dim)
     reduce_over_batch = jnp.sum if cfg.batch_independent_guidance else jnp.mean
     beta_current = jnp.float32(effective_beta(cfg))
+    sampler = getattr(cfg, "sampler", "mala")
+    if sampler == "dps":
+        guidance_gradient_space = "xt"
+    elif sampler == "mpgd":
+        guidance_gradient_space = "x0hat"
+    else:
+        guidance_gradient_space = cfg.guidance_gradient_space
+    denoising_beta = jnp.float32(0.0) if sampler == "unguided" else beta_current
 
     def reconstruct_x0_from_noise(x_in, t_idx, noise_pred):
         return (
@@ -425,9 +534,32 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
             - noise_pred * schedule.sqrt_recipm1_alphas_cumprod[t_idx]
         )
 
+    def q_value(act):
+        a = act[..., 0]
+        if cfg.reward_type == "quadratic":
+            return -jnp.float32(cfg.reward_scale) * (a - jnp.float32(cfg.reward_center)) ** 2
+        centers = jnp.asarray(cfg.reward_bump_centers, dtype=act.dtype)
+        widths = jnp.asarray(cfg.reward_bump_widths, dtype=act.dtype)
+        weights = jnp.asarray(cfg.reward_bump_weights, dtype=act.dtype)
+        bumps = jnp.sum(
+            weights[None, :] * jnp.exp(-0.5 * ((a[..., None] - centers[None, :]) / widths[None, :]) ** 2),
+            axis=-1,
+        )
+        penalty = jnp.float32(cfg.reward_l2) * a ** 2 + jnp.float32(cfg.reward_l4) * a ** 4
+        if cfg.reward_type == "bumps":
+            return bumps - penalty
+        if cfg.reward_type == "rugged":
+            return (
+                bumps
+                + jnp.float32(cfg.reward_sin_amp)
+                * jnp.sin(jnp.float32(cfg.reward_sin_freq) * a + jnp.float32(cfg.reward_sin_phase))
+                - penalty
+            )
+        raise ValueError(f"Unknown reward_type: {cfg.reward_type}")
+
     def q_at_clipped_x0_hat(x0_hat):
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
-        return model.q(None, None, x0_clipped)
+        return q_value(x0_clipped)
 
     def base_x0_hat(x_in, t_idx):
         if cfg.x0_hat_method == "posterior_mean":
@@ -449,11 +581,13 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         return jnp.float32(cfg.guidance_strength_multiplier) * reduce_over_batch(q)
 
     def compute_guidance_gradient(x_in, t_idx):
-        if cfg.guidance_gradient_space == "xt":
+        if sampler == "unguided":
+            return jnp.zeros_like(x_in)
+        if guidance_gradient_space == "xt":
             return jax.grad(lambda x: guidance_value_from_x(x, t_idx))(x_in)
 
         x0_hat = base_x0_hat(x_in, t_idx)
-        if cfg.guidance_gradient_space == "x0hat":
+        if guidance_gradient_space == "x0hat":
             return jax.grad(
                 lambda x0: jnp.float32(cfg.guidance_strength_multiplier) * reduce_over_batch(
                     q_at_clipped_x0_hat(x0)
@@ -463,7 +597,7 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
         return jax.grad(
             lambda action: jnp.float32(cfg.guidance_strength_multiplier) * reduce_over_batch(
-                model.q(None, None, action)
+                q_value(action)
             )
         )(jax.lax.stop_gradient(x0_clipped))
 
@@ -472,13 +606,13 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
         x0_hat = base_x0_hat(x, t_idx)
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
-        q = model.q(None, None, x0_clipped)
-        if cfg.guidance_gradient_space == "x0hat":
+        q = q_value(x0_clipped)
+        if guidance_gradient_space == "x0hat":
             grad_q = jax.grad(lambda x0: jnp.sum(q_at_clipped_x0_hat(x0)))(
                 jax.lax.stop_gradient(x0_hat)
             )
         else:
-            grad_q = jax.grad(lambda action: jnp.sum(model.q(None, None, action)))(
+            grad_q = jax.grad(lambda action: jnp.sum(q_value(action)))(
                 jax.lax.stop_gradient(x0_clipped)
             )
         energy = jnp.float32(cfg.alpha) * E_vals - beta_current * q
@@ -490,20 +624,20 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         noise_pred_scaled = jnp.float32(cfg.alpha) * model.eps_pred(None, None, x_in, t_idx)
         grad_q = compute_guidance_gradient(x_in, t_idx)
         sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
-        return noise_pred_scaled - beta_current * sigma_t * grad_q
+        return noise_pred_scaled - denoising_beta * sigma_t * grad_q
 
     def guided_x0_and_eps(t_idx, x_in):
         eps_base = model.eps_pred(None, None, x_in, t_idx)
         grad_q = compute_guidance_gradient(x_in, t_idx)
         sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
         sqrt_ab_t = schedule.sqrt_alphas_cumprod[t_idx]
-        eps_guided = jnp.float32(cfg.alpha) * eps_base - beta_current * sigma_t * grad_q
+        eps_guided = jnp.float32(cfg.alpha) * eps_base - denoising_beta * sigma_t * grad_q
         # Algebraically equal to reconstruct_x0_from_noise(x, t, eps_guided),
         # but uses the closed-form oracle E[x0 | x_t] to avoid high-noise cancellation.
         x0_guided = (
             jnp.float32(cfg.alpha) * base_x0_hat(x_in, t_idx)
             + (jnp.float32(1.0) - jnp.float32(cfg.alpha)) * x_in / sqrt_ab_t
-            + beta_current * (sigma_t * sigma_t / sqrt_ab_t) * grad_q
+            + denoising_beta * (sigma_t * sigma_t / sqrt_ab_t) * grad_q
         )
         return x0_guided, eps_guided
 
@@ -542,7 +676,7 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
 
         def mala_body(_, state):
             x_current, rng_step, log_eta_scale, accept_rate_sum, clip_frac_sum = state
-            if cfg.guidance_gradient_space == "xt":
+            if guidance_gradient_space == "xt":
                 E_x, vjp_x, clip_x = jax.vjp(lambda xx: energy_total(t_idx, xx), x_current, has_aux=True)
                 grad_E_x = vjp_x(jnp.ones_like(E_x))[0]
             else:
@@ -555,7 +689,7 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
             rng_step, noise_key, u_key = jax.random.split(rng_step, 3)
             x_prop = proposal_mean + proposal_std * jax.random.normal(noise_key, x_current.shape)
 
-            if cfg.guidance_gradient_space == "xt":
+            if guidance_gradient_space == "xt":
                 E_x_prop, vjp_x_prop, _clip_prop = jax.vjp(lambda xx: energy_total(t_idx, xx), x_prop, has_aux=True)
                 grad_E_x_prop = vjp_x_prop(jnp.ones_like(E_x_prop))[0]
             else:
@@ -596,19 +730,57 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         denom = jnp.maximum(jnp.float32(cfg.mala_steps), jnp.float32(1.0))
         return mala_corrected_x_t, rng_out, log_eta_scales, acc_sum / denom, clip_sum / denom
 
+    def run_langevin_chain_at_level(t_idx, x_t, rng):
+        step_size = jnp.clip(
+            jnp.float32(cfg.langevin_eta) * jnp.maximum(schedule.betas[t_idx], jnp.float32(1e-8)),
+            jnp.float32(1e-8),
+            jnp.float32(0.5),
+        )
+        proposal_std = jnp.sqrt(jnp.float32(2.0) * step_size)
+
+        def langevin_body(_, state):
+            x_current, rng_step, clip_frac_sum = state
+            if guidance_gradient_space == "xt":
+                E_x, vjp_x, clip_x = jax.vjp(lambda xx: energy_total(t_idx, xx), x_current, has_aux=True)
+                grad_E_x = vjp_x(jnp.ones_like(E_x))[0]
+            else:
+                _E_x, grad_E_x, clip_x = jacobian_free_energy_and_drift(t_idx, x_current)
+            rng_step, noise_key = jax.random.split(rng_step)
+            x_next = x_current - step_size * grad_E_x + proposal_std * jax.random.normal(noise_key, x_current.shape)
+            return x_next, rng_step, clip_frac_sum + clip_x
+
+        langevin_x_t, rng_out, clip_sum = jax.lax.fori_loop(
+            0,
+            cfg.langevin_steps,
+            langevin_body,
+            (x_t, rng, jnp.float32(0.0)),
+        )
+        denom = jnp.maximum(jnp.float32(cfg.langevin_steps), jnp.float32(1.0))
+        return langevin_x_t, rng_out, clip_sum / denom
+
     def _run(k):
         key_x, loop_key = jax.random.split(k, 2)
         x_t = jax.random.normal(key_x, action_shape)
-        log_eta_scales = jnp.zeros((cfg.diffusion_steps,), dtype=jnp.float32)
+        initial_log_eta = jnp.log(jnp.maximum(jnp.float32(cfg.mala_eta), jnp.float32(1e-8)))
+        log_eta_scales = jnp.full((cfg.diffusion_steps,), initial_log_eta, dtype=jnp.float32)
         per_level_acc = jnp.zeros((cfg.diffusion_steps,), dtype=jnp.float32)
         per_level_clip = jnp.zeros((cfg.diffusion_steps,), dtype=jnp.float32)
         trace = jnp.zeros((cfg.diffusion_steps, cfg.num_samples, model.act_dim), dtype=jnp.float32)
 
         for i in range(cfg.diffusion_steps):
             t_idx = cfg.diffusion_steps - 1 - i
-            mala_x_t, loop_key, log_eta_scales, acc, clip_frac = run_mala_chain_at_level(
-                t_idx, x_t, loop_key, log_eta_scales
-            )
+            if sampler == "mala":
+                mala_x_t, loop_key, log_eta_scales, acc, clip_frac = run_mala_chain_at_level(
+                    t_idx, x_t, loop_key, log_eta_scales
+                )
+            elif sampler == "langevin":
+                mala_x_t, loop_key, clip_frac = run_langevin_chain_at_level(t_idx, x_t, loop_key)
+                acc = jnp.float32(jnp.nan)
+            else:
+                mala_x_t = x_t
+                x0_hat = base_x0_hat(mala_x_t, t_idx)
+                acc = jnp.float32(jnp.nan)
+                clip_frac = jnp.mean((jnp.abs(x0_hat) > cfg.x0_hat_clip_radius).astype(jnp.float32))
             trace = trace.at[t_idx].set(mala_x_t)
             per_level_acc = per_level_acc.at[t_idx].set(acc)
             per_level_clip = per_level_clip.at[t_idx].set(clip_frac)
@@ -633,18 +805,30 @@ def main() -> None:
     weights = _normalize_weights(_parse_float_list(args.gmm_weights))
     means = np.asarray(_parse_float_list(args.gmm_means), dtype=np.float64)
     stds = np.asarray(_parse_float_list(args.gmm_stds), dtype=np.float64)
+    reward_bump_centers = _parse_float_list(args.reward_bump_centers)
+    reward_bump_widths = _parse_float_list(args.reward_bump_widths)
+    reward_bump_weights = _parse_float_list(args.reward_bump_weights)
     if not (len(weights) == len(means) == len(stds)):
         raise ValueError("GMM weights, means, and stds must have the same length.")
     if np.any(stds <= 0):
         raise ValueError("GMM stds must be positive.")
 
     cfg = ToyConfig(
+        target_preset=args.target_preset,
         gmm_weights=weights.tolist(),
         gmm_means=means.tolist(),
         gmm_stds=stds.tolist(),
         reward_type=args.reward_type,
         reward_center=args.reward_center,
         reward_scale=args.reward_scale,
+        reward_bump_centers=reward_bump_centers,
+        reward_bump_widths=reward_bump_widths,
+        reward_bump_weights=reward_bump_weights,
+        reward_sin_amp=args.reward_sin_amp,
+        reward_sin_freq=args.reward_sin_freq,
+        reward_sin_phase=args.reward_sin_phase,
+        reward_l2=args.reward_l2,
+        reward_l4=args.reward_l4,
         num_samples=args.num_samples,
         seed=args.seed,
         diffusion_steps=args.diffusion_steps,
@@ -652,7 +836,11 @@ def main() -> None:
         snr_max=args.snr_max,
         alpha=args.alpha,
         beta=args.beta,
+        sampler=args.sampler,
         mala_steps=args.mala_steps,
+        mala_eta=args.mala_eta,
+        langevin_steps=args.langevin_steps,
+        langevin_eta=args.langevin_eta,
         denoising_predictor=args.denoising_predictor,
         guidance_gradient_space=args.guidance_gradient_space,
         x0_hat_method=args.x0_hat_method,
@@ -670,6 +858,8 @@ def main() -> None:
         eval_timesteps=args.eval_timesteps,
         output_dir=args.output_dir,
     )
+    _validate_reward_params(cfg)
+    _validate_sampler_params(cfg)
 
     clip_cover = float(np.max(np.abs(means) + 4.0 * stds))
     if np.isfinite(cfg.x0_hat_clip_radius) and clip_cover > cfg.x0_hat_clip_radius:
@@ -715,7 +905,6 @@ def main() -> None:
         "stage": "final_clean",
         "timestep": -1,
         "acceptance_rate": float(np.asarray(result.per_level_acc)[0]),
-        "clip_fraction": float(np.asarray(result.per_level_clip)[0]),
     })
     rows.append(final_metrics)
     panels.append({
@@ -736,7 +925,6 @@ def main() -> None:
         "stage": "final_clipped_action",
         "timestep": -1,
         "acceptance_rate": float("nan"),
-        "clip_fraction": float(np.mean(np.abs(raw_x0) > 1.0)),
     })
     rows.append(clipped_metrics)
 
@@ -756,7 +944,6 @@ def main() -> None:
             "stage": "intermediate",
             "timestep": int(t),
             "acceptance_rate": float(np.asarray(result.per_level_acc)[t]),
-            "clip_fraction": float(np.asarray(result.per_level_clip)[t]),
         })
         rows.append(metrics)
         panels.append({
@@ -775,7 +962,8 @@ def main() -> None:
         out / "plots" / "density_panel.png",
         panels,
         (
-            f"mala_steps={cfg.mala_steps}, gradient={cfg.guidance_gradient_space}, "
+            f"sampler={cfg.sampler}, mala_steps={cfg.mala_steps}, langevin_steps={cfg.langevin_steps}, "
+            f"gradient={cfg.guidance_gradient_space}, "
             f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
         ),
     )
@@ -795,7 +983,7 @@ def main() -> None:
     fieldnames = [
         "stage", "timestep", "kl_sample_target", "js", "w1", "ks",
         "sample_mean_q", "target_mean_q", "sample_mean", "sample_std",
-        "acceptance_rate", "clip_fraction",
+        "acceptance_rate",
     ]
     with open(out / "metrics.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -808,7 +996,7 @@ def main() -> None:
         print(
             f"{row['stage']:>20s} t={row['timestep']:>3} "
             f"W1={row['w1']:.5f} KS={row['ks']:.5f} JS={row['js']:.5f} "
-            f"acc={row['acceptance_rate']:.3f} clip={row['clip_fraction']:.3f}"
+            f"acc={row['acceptance_rate']:.3f}"
         )
 
 

@@ -12,9 +12,13 @@ import argparse
 import csv
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "xdg-cache"))
 
 import matplotlib
 matplotlib.use("Agg")
@@ -25,7 +29,13 @@ import numpy as np
 KEY_COLUMNS = [
     "run_name",
     "run_dir",
+    "target_preset",
+    "reward_type",
+    "sampler",
     "mala_steps",
+    "mala_eta",
+    "langevin_steps",
+    "langevin_eta",
     "guidance_gradient_space",
     "denoising_predictor",
     "x0_hat_method",
@@ -56,7 +66,6 @@ METRIC_COLUMNS = [
     "sample_mean",
     "sample_std",
     "acceptance_rate",
-    "clip_fraction",
 ]
 
 
@@ -81,9 +90,11 @@ def parse_args():
     p.add_argument("--match", default="toy_mala_*",
                    help="Directory glob under --runs-root when --runs-file is not used.")
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--metrics-file", type=Path, default=None,
+                   help="Replot from an existing sweep_metrics.csv without reading run directories.")
     p.add_argument("--overwrite-metrics", action="store_true",
                    help="Recompute metrics.csv from samples.npz before aggregating.")
-    p.add_argument("--heatmap-metrics", default="w1,ks,js,acceptance_rate,clip_fraction",
+    p.add_argument("--heatmap-metrics", default="kl_sample_target,js,w1,ks,sample_mean_q,target_mean_q,sample_mean,sample_std,acceptance_rate",
                    help="Comma-separated metric names to visualize as sweep heatmaps.")
     p.add_argument("--expected-runs", type=int, default=None,
                    help="Fail if the number of discovered completed run directories differs.")
@@ -136,6 +147,8 @@ def write_experiment_metadata(
     panel_dir: Path,
     heatmap_dir: Path,
     heatmap_count: int,
+    curve_dir: Path,
+    curve_count: int,
 ) -> tuple[Path, Path]:
     fixed, swept = split_fixed_and_swept(configs)
     metadata = {
@@ -153,6 +166,8 @@ def write_experiment_metadata(
             "panels": str(panel_dir),
             "heatmaps": str(heatmap_dir),
             "heatmap_count": heatmap_count,
+            "quality_curves": str(curve_dir),
+            "quality_curve_count": curve_count,
         },
         "run_dirs": [str(p) for p in run_dirs],
     }
@@ -170,6 +185,7 @@ def write_experiment_metadata(
         f"- Run manifest: `{manifest_path.name}`",
         f"- Panels: `{panel_dir.name}/`",
         f"- Heatmaps: `{heatmap_dir.name}/` ({heatmap_count} files)",
+        f"- Quality curves: `{curve_dir.name}/` ({curve_count} files)",
         "",
         "## Swept Parameters",
         "",
@@ -196,6 +212,11 @@ def discover_runs(args) -> list[Path]:
 
 
 def read_metrics(path: Path) -> list[dict]:
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def read_table(path: Path) -> list[dict]:
     with open(path, newline="") as f:
         return list(csv.DictReader(f))
 
@@ -307,8 +328,28 @@ def np_base_score(x, weights, means, stds, schedule, t_idx: int):
     return np.sum(resp * (-(x[:, None] - loc[None, :]) / var[None, :]), axis=-1)
 
 
-def np_reward(a, center, scale):
-    return -scale * (np.asarray(a) - center) ** 2
+def np_reward(a, center, scale, cfg=None):
+    a = np.asarray(a, dtype=np.float64)
+    if cfg is None or getattr(cfg, "reward_type", "quadratic") == "quadratic":
+        return -scale * (a - center) ** 2
+    centers = np.asarray(getattr(cfg, "reward_bump_centers"), dtype=np.float64)
+    widths = np.asarray(getattr(cfg, "reward_bump_widths"), dtype=np.float64)
+    weights = np.asarray(getattr(cfg, "reward_bump_weights"), dtype=np.float64)
+    bumps = np.sum(
+        weights[None, :] * np.exp(-0.5 * ((a[..., None] - centers[None, :]) / widths[None, :]) ** 2),
+        axis=-1,
+    )
+    penalty = float(getattr(cfg, "reward_l2", 0.0)) * a ** 2 + float(getattr(cfg, "reward_l4", 0.0)) * a ** 4
+    if cfg.reward_type == "bumps":
+        return bumps - penalty
+    if cfg.reward_type == "rugged":
+        return (
+            bumps
+            + float(getattr(cfg, "reward_sin_amp", 0.0))
+            * np.sin(float(getattr(cfg, "reward_sin_freq", 0.0)) * a + float(getattr(cfg, "reward_sin_phase", 0.0)))
+            - penalty
+        )
+    raise ValueError(f"Unknown reward_type: {cfg.reward_type}")
 
 
 def effective_beta(cfg) -> float:
@@ -351,7 +392,9 @@ def target_density(grid, cfg, weights, means, stds, schedule, t_idx: int | None)
         x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t_idx)
         r = cfg.x0_hat_clip_radius
         q_arg = np.clip(x0_hat, -r, r) if np.isfinite(r) else x0_hat
-    log_unnorm = cfg.alpha * base_log + effective_beta(cfg) * np_reward(q_arg, cfg.reward_center, cfg.reward_scale)
+    log_unnorm = cfg.alpha * base_log + effective_beta(cfg) * np_reward(
+        q_arg, cfg.reward_center, cfg.reward_scale, cfg
+    )
     return normalized_density_on_grid(log_unnorm, grid)
 
 
@@ -384,8 +427,11 @@ def metrics_from_samples(samples, grid, target_dens, cfg, *, q_sample_arg=None, 
         q_sample_arg = samples
     if q_grid_arg is None:
         q_grid_arg = grid
-    q_sample = float(np.mean(np_reward(q_sample_arg, cfg.reward_center, cfg.reward_scale)))
-    q_target = float(integrate_trapezoid(np_reward(q_grid_arg, cfg.reward_center, cfg.reward_scale) * target_dens, grid))
+    q_sample = float(np.mean(np_reward(q_sample_arg, cfg.reward_center, cfg.reward_scale, cfg)))
+    q_target = float(integrate_trapezoid(
+        np_reward(q_grid_arg, cfg.reward_center, cfg.reward_scale, cfg) * target_dens,
+        grid,
+    ))
     return {
         "kl_sample_target": kl_sample_target,
         "js": js,
@@ -471,6 +517,21 @@ def sorted_unique(values):
     return vals
 
 
+def predictor_order(value):
+    order = {"DDIM": 0, "DDPM_mean": 1, "Identity": 2}
+    return (order.get(value, 99), value)
+
+
+HEATMAP_STAGE_KEYS = [
+    "final_clean",
+    "intermediate_t000",
+    "intermediate_t005",
+    "intermediate_t010",
+    "intermediate_t015",
+    "intermediate_t019",
+]
+
+
 def row_stage_key(row):
     stage = row["stage"]
     if stage == "intermediate":
@@ -478,62 +539,140 @@ def row_stage_key(row):
     return stage
 
 
+def short_stage_label(stage_key: str) -> str:
+    if stage_key == "final_clean":
+        return "final_clean"
+    return stage_key.replace("intermediate_", "")
+
+
+def panel_title(beta, sampler, eta, gradient) -> str:
+    eta_text = f"eta={eta:g}" if eta is not None and np.isfinite(eta) else "eta=?"
+    if sampler == "mala":
+        return f"MALA | {gradient}\n{eta_text}, beta={beta:g}"
+    return f"Langevin | {gradient}\n{eta_text}, beta={beta:g}"
+
+
+def algorithm_panel_order(row_key):
+    beta, sampler, eta, gradient = row_key
+    sampler_rank = 0 if sampler == "mala" else 1
+    eta_rank = -1.0 if eta is None or not np.isfinite(eta) else eta
+    grad_rank = 0 if gradient == "xt" else 1
+    return (sampler_rank, eta_rank, grad_rank, beta)
+
+
 def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
+    reference_rows = [
+        row for row in rows
+        if (
+            row_stage_key(row) == stage_key
+            and np.isfinite(as_float(row.get(metric)))
+            and (row.get("sampler", "mala") or "mala") in {"dps", "mpgd", "unguided"}
+        )
+    ]
     selected = [
         row for row in rows
-        if row_stage_key(row) == stage_key and np.isfinite(as_float(row.get(metric)))
+        if (
+            row_stage_key(row) == stage_key
+            and np.isfinite(as_float(row.get(metric)))
+            and (row.get("sampler", "mala") or "mala") in {"mala", "langevin"}
+        )
     ]
     if not selected:
         return False
 
     betas = sorted_unique([as_float(row["beta"]) for row in selected])
-    gradients = sorted_unique([row["guidance_gradient_space"] for row in selected])
-    mala_steps = sorted_unique([int(float(row["mala_steps"])) for row in selected])
-    predictors = sorted_unique([row["denoising_predictor"] for row in selected])
-    if not mala_steps or not predictors:
+    algo_keys = []
+    for row in selected:
+        sampler = row.get("sampler", "mala") or "mala"
+        eta = as_float(row.get("mala_eta", 1.0)) if sampler == "mala" else as_float(row.get("langevin_eta", ""))
+        key = (sampler, eta)
+        if key not in algo_keys:
+            algo_keys.append(key)
+    sampler_order = {"mala": 0, "langevin": 1}
+    algo_keys = sorted(
+        algo_keys,
+        key=lambda x: (sampler_order.get(x[0], 99), -1.0 if x[1] is None or not np.isfinite(x[1]) else x[1]),
+    )
+    gradients = [g for g in ["xt", "x0hat"] if any(row["guidance_gradient_space"] == g for row in selected)]
+    corrector_steps = sorted_unique([
+        int(float(row["langevin_steps"] if (row.get("sampler", "mala") or "mala") == "langevin" else row["mala_steps"]))
+        for row in selected
+    ])
+    predictors = sorted(set(row["denoising_predictor"] for row in selected), key=predictor_order)
+    if not corrector_steps or not predictors:
         return False
 
-    nrows = max(1, len(betas))
-    ncols = max(1, len(gradients))
+    panel_keys = sorted(
+        [(beta, sampler, eta, gradient) for beta in betas for sampler, eta in algo_keys for gradient in gradients],
+        key=algorithm_panel_order,
+    )
+    ncols = 2
+    nrows = int(np.ceil(len(panel_keys) / ncols))
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(4.2 * ncols, 3.4 * nrows),
+        figsize=(8.2 * ncols + 1.4, 5.7 * nrows + 0.8),
         squeeze=False,
-        constrained_layout=True,
     )
+    for ax in axes.ravel()[len(panel_keys):]:
+        ax.axis("off")
 
     all_values = np.asarray([as_float(row[metric]) for row in selected], dtype=np.float64)
     finite_values = all_values[np.isfinite(all_values)]
     vmin = float(np.min(finite_values)) if finite_values.size else None
     vmax = float(np.max(finite_values)) if finite_values.size else None
     image = None
-    for i, beta in enumerate(betas):
-        for j, gradient in enumerate(gradients):
-            ax = axes[i][j]
-            mat = np.full((len(mala_steps), len(predictors)), np.nan, dtype=np.float64)
-            for row in selected:
-                if as_float(row["beta"]) != beta or row["guidance_gradient_space"] != gradient:
-                    continue
-                y = mala_steps.index(int(float(row["mala_steps"])))
-                x = predictors.index(row["denoising_predictor"])
-                mat[y, x] = as_float(row[metric])
-            image = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
-            ax.set_xticks(np.arange(len(predictors)), predictors, rotation=35, ha="right")
-            ax.set_yticks(np.arange(len(mala_steps)), mala_steps)
-            ax.set_xlabel("denoising predictor")
-            ax.set_ylabel("mala steps")
-            ax.set_title(f"beta={beta:g}, gradient={gradient}")
-            for y in range(len(mala_steps)):
-                for x in range(len(predictors)):
-                    val = mat[y, x]
-                    if np.isfinite(val):
-                        ax.text(x, y, f"{val:.3g}", ha="center", va="center", color="white", fontsize=8)
+    for ax, (beta, sampler, eta, gradient) in zip(axes.ravel(), panel_keys):
+        mat = np.full((len(corrector_steps), len(predictors)), np.nan, dtype=np.float64)
+        for row in selected:
+            row_sampler = row.get("sampler", "mala") or "mala"
+            row_eta = as_float(row.get("mala_eta", 1.0)) if row_sampler == "mala" else as_float(row.get("langevin_eta", ""))
+            eta_matches = row_eta == eta
+            if (
+                as_float(row["beta"]) != beta
+                or row_sampler != sampler
+                or not eta_matches
+                or row["guidance_gradient_space"] != gradient
+            ):
+                continue
+            step_value = row["langevin_steps"] if row_sampler == "langevin" else row["mala_steps"]
+            y = corrector_steps.index(int(float(step_value)))
+            x = predictors.index(row["denoising_predictor"])
+            mat[y, x] = as_float(row[metric])
+        image = ax.imshow(mat, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
+        ax.set_xticks(np.arange(len(predictors)), predictors, rotation=25, ha="right", fontsize=11)
+        ax.set_yticks(np.arange(len(corrector_steps)), corrector_steps, fontsize=11)
+        ax.set_xlabel("denoising predictor", fontsize=12)
+        ax.set_ylabel("corrector steps", fontsize=12)
+        ax.set_title(panel_title(beta, sampler, eta, gradient), fontsize=13, pad=10)
+        for y in range(len(corrector_steps)):
+            for x in range(len(predictors)):
+                val = mat[y, x]
+                if np.isfinite(val):
+                    ax.text(x, y, f"{val:.3g}", ha="center", va="center", color="white", fontsize=10)
 
     if image is not None:
-        fig.colorbar(image, ax=axes.ravel().tolist(), shrink=0.85, label=metric)
-    fig.suptitle(f"{stage_key}: {metric}")
-    fig.savefig(out_path, dpi=180)
+        cax = fig.add_axes([0.915, 0.14, 0.018, 0.74])
+        fig.colorbar(image, cax=cax, label=metric)
+    if reference_rows:
+        ref_text = " | ".join(
+            f"{row.get('sampler')}:{row.get('denoising_predictor')} "
+            f"beta={as_float(row.get('beta')):g} {metric}={as_float(row.get(metric)):.4g}"
+            for row in reference_rows[:8]
+        )
+        if len(reference_rows) > 8:
+            ref_text += f" | +{len(reference_rows) - 8} more refs in sweep_metrics.csv"
+        fig.text(0.5, 0.035, f"DDIM references: {ref_text}", ha="center", va="bottom", fontsize=10, wrap=True)
+    fig.suptitle(f"{stage_key}: {metric}", fontsize=16)
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.885,
+        bottom=0.13 if reference_rows else 0.065,
+        top=0.93,
+        hspace=0.62,
+        wspace=0.28,
+    )
+    fig.savefig(out_path, dpi=240)
     plt.close(fig)
     return True
 
@@ -541,12 +680,111 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
 def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str]) -> int:
     heatmap_dir = out_dir / "heatmaps"
     heatmap_dir.mkdir(exist_ok=True)
-    stage_keys = sorted_unique([row_stage_key(row) for row in rows])
+    present = set(row_stage_key(row) for row in rows)
+    stage_keys = [stage_key for stage_key in HEATMAP_STAGE_KEYS if stage_key in present]
     count = 0
     for stage_key in stage_keys:
+        stage_dir = heatmap_dir / short_stage_label(stage_key)
+        stage_dir.mkdir(exist_ok=True)
         for metric in metrics:
-            path = heatmap_dir / f"{stage_key}_{metric}.png"
+            path = stage_dir / f"{metric}.png"
             if save_heatmap_grid(rows, metric, stage_key, path):
+                count += 1
+    return count
+
+
+def save_quality_curve(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
+    selected = [
+        row for row in rows
+        if (
+            row_stage_key(row) == stage_key
+            and np.isfinite(as_float(row.get(metric)))
+            and (row.get("sampler", "mala") or "mala") in {"mala", "langevin"}
+        )
+    ]
+    if not selected:
+        return False
+
+    predictors = sorted_unique([row["denoising_predictor"] for row in selected])
+    fig, axes = plt.subplots(
+        1,
+        len(predictors),
+        figsize=(5.0 * len(predictors), 3.8),
+        squeeze=False,
+        constrained_layout=True,
+    )
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
+    reference_rows = [
+        row for row in rows
+        if (
+            row_stage_key(row) == stage_key
+            and np.isfinite(as_float(row.get(metric)))
+            and (row.get("sampler", "mala") or "mala") in {"dps", "mpgd", "unguided"}
+        )
+    ]
+
+    any_line = False
+    for ax, predictor in zip(axes.ravel(), predictors):
+        pred_rows = [row for row in selected if row["denoising_predictor"] == predictor]
+        groups = {}
+        for row in pred_rows:
+            sampler = row.get("sampler", "mala") or "mala"
+            gradient = row["guidance_gradient_space"]
+            eta = as_float(row.get("mala_eta", 1.0)) if sampler == "mala" else as_float(row.get("langevin_eta", ""))
+            key = (sampler, eta, gradient)
+            step_value = row["langevin_steps"] if sampler == "langevin" else row["mala_steps"]
+            groups.setdefault(key, []).append((int(float(step_value)), as_float(row[metric])))
+
+        for (sampler, eta, gradient), points in sorted(
+            groups.items(),
+            key=lambda item: (0 if item[0][0] == "mala" else 1, -1 if item[0][1] is None else item[0][1], item[0][2]),
+        ):
+            points = sorted(points)
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
+            if not xs:
+                continue
+            eta_label = f" eta={eta:g}" if eta is not None and np.isfinite(eta) else ""
+            label = f"{sampler}{eta_label} {gradient}"
+            color_idx = abs(hash((sampler, round(float(eta), 8) if np.isfinite(eta) else None, gradient))) % max(len(color_cycle), 1)
+            color = color_cycle[color_idx] if color_cycle else None
+            ax.plot(xs, ys, marker="o", label=label, color=color)
+            any_line = True
+
+        for ref in reference_rows:
+            if ref.get("denoising_predictor") != predictor:
+                continue
+            sampler = ref.get("sampler", "")
+            val = as_float(ref.get(metric))
+            ax.axhline(val, linestyle="--", linewidth=1.0, alpha=0.75, label=f"{sampler} ref")
+
+        ax.set_title(predictor)
+        ax.set_xlabel("corrector steps")
+        ax.set_ylabel(metric)
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8)
+
+    if not any_line:
+        plt.close(fig)
+        return False
+    fig.suptitle(f"{stage_key}: {metric} vs corrector steps")
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return True
+
+
+def save_quality_curves(rows: list[dict], out_dir: Path, metrics: list[str]) -> int:
+    curve_dir = out_dir / "quality_curves"
+    curve_dir.mkdir(exist_ok=True)
+    present = set(row_stage_key(row) for row in rows)
+    stage_keys = [stage_key for stage_key in HEATMAP_STAGE_KEYS if stage_key in present]
+    curve_metrics = [m for m in metrics if m in {"kl_sample_target", "js", "w1", "ks", "sample_mean_q"}]
+    count = 0
+    for stage_key in stage_keys:
+        stage_dir = curve_dir / short_stage_label(stage_key)
+        stage_dir.mkdir(exist_ok=True)
+        for metric in curve_metrics:
+            if save_quality_curve(rows, metric, stage_key, stage_dir / f"{metric}.png"):
                 count += 1
     return count
 
@@ -577,7 +815,6 @@ def recompute_metrics_and_panels(run_dir: Path, cfg: ToyConfig) -> list[dict]:
         "stage": "final_clean",
         "timestep": -1,
         "acceptance_rate": float(per_level_acc[0]),
-        "clip_fraction": float(per_level_clip[0]),
     })
     rows.append(final_metrics)
     panels.append({
@@ -596,7 +833,6 @@ def recompute_metrics_and_panels(run_dir: Path, cfg: ToyConfig) -> list[dict]:
         "stage": "final_clipped_action",
         "timestep": -1,
         "acceptance_rate": float("nan"),
-        "clip_fraction": float(np.mean(np.abs(raw_x0) > 1.0)),
     })
     rows.append(clipped_metrics)
 
@@ -620,7 +856,6 @@ def recompute_metrics_and_panels(run_dir: Path, cfg: ToyConfig) -> list[dict]:
             "stage": "intermediate",
             "timestep": int(t),
             "acceptance_rate": float(per_level_acc[t]),
-            "clip_fraction": float(per_level_clip[t]),
         })
         rows.append(metrics)
         panels.append({
@@ -640,7 +875,8 @@ def recompute_metrics_and_panels(run_dir: Path, cfg: ToyConfig) -> list[dict]:
         panel_path,
         panels,
         (
-            f"mala_steps={cfg.mala_steps}, gradient={cfg.guidance_gradient_space}, "
+            f"sampler={get_cfg_attr(cfg, 'sampler', 'mala')}, mala_steps={cfg.mala_steps}, "
+            f"gradient={cfg.guidance_gradient_space}, "
             f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
         ),
     )
@@ -650,9 +886,21 @@ def recompute_metrics_and_panels(run_dir: Path, cfg: ToyConfig) -> list[dict]:
 def main():
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    heatmap_metrics = [m.strip() for m in args.heatmap_metrics.replace(",", " ").split() if m.strip()]
+
+    if args.metrics_file is not None:
+        all_rows = read_table(args.metrics_file)
+        if not all_rows:
+            raise SystemExit(f"No rows found in metrics file: {args.metrics_file}")
+        heatmap_count = save_all_heatmaps(all_rows, args.out_dir, heatmap_metrics)
+        curve_count = save_quality_curves(all_rows, args.out_dir, heatmap_metrics)
+        print(f"replotted from: {args.metrics_file}")
+        print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
+        print(f"quality curve images: {args.out_dir / 'quality_curves'} ({curve_count} files)")
+        return
+
     panel_dir = args.out_dir / "panels"
     panel_dir.mkdir(exist_ok=True)
-    heatmap_metrics = [m.strip() for m in args.heatmap_metrics.replace(",", " ").split() if m.strip()]
     runs = discover_runs(args)
     if not runs:
         raise SystemExit("No completed toy MALA run directories found.")
@@ -683,7 +931,13 @@ def main():
         prefix = {
             "run_name": run_dir.name,
             "run_dir": str(run_dir),
+            "target_preset": get_cfg_attr(cfg, "target_preset", "manual"),
+            "reward_type": get_cfg_attr(cfg, "reward_type", "quadratic"),
+            "sampler": get_cfg_attr(cfg, "sampler", "mala"),
             "mala_steps": cfg.mala_steps,
+            "mala_eta": get_cfg_attr(cfg, "mala_eta", 1.0),
+            "langevin_steps": get_cfg_attr(cfg, "langevin_steps", ""),
+            "langevin_eta": get_cfg_attr(cfg, "langevin_eta", ""),
             "guidance_gradient_space": cfg.guidance_gradient_space,
             "denoising_predictor": cfg.denoising_predictor,
             "x0_hat_method": get_cfg_attr(cfg, "x0_hat_method", "posterior_mean"),
@@ -720,7 +974,9 @@ def main():
             writer.writerow({k: row.get(k, "") for k in KEY_COLUMNS + METRIC_COLUMNS})
 
     heatmap_count = save_all_heatmaps(all_rows, args.out_dir, heatmap_metrics)
+    curve_count = save_quality_curves(all_rows, args.out_dir, heatmap_metrics)
     heatmap_dir = args.out_dir / "heatmaps"
+    curve_dir = args.out_dir / "quality_curves"
     config_path, readme_path = write_experiment_metadata(
         args.out_dir,
         args=args,
@@ -732,6 +988,8 @@ def main():
         panel_dir=panel_dir,
         heatmap_dir=heatmap_dir,
         heatmap_count=heatmap_count,
+        curve_dir=curve_dir,
+        curve_count=curve_count,
     )
     print(f"runs summarized: {len(runs)}")
     print(f"experiment config: {config_path}")
@@ -740,6 +998,7 @@ def main():
     print(f"summary table: {summary_path}")
     print(f"panel images: {panel_dir}")
     print(f"heatmap images: {heatmap_dir} ({heatmap_count} files)")
+    print(f"quality curve images: {curve_dir} ({curve_count} files)")
 
 
 if __name__ == "__main__":

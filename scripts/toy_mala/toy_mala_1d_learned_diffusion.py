@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -29,11 +30,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from relax.network.actor_critic import ActorCritic
 from scripts.toy_mala.toy_mala_1d import (
+    _apply_target_preset,
     _eval_timesteps,
     _normalize_weights,
     _parse_float_list,
+    _validate_sampler_params,
+    _validate_reward_params,
     make_eval_grid,
     metrics_from_samples,
     np_x0_hat,
@@ -46,12 +54,21 @@ from scripts.toy_mala.toy_mala_1d import (
 
 @dataclass(frozen=True)
 class LearnedToyConfig:
+    target_preset: str
     gmm_weights: list[float]
     gmm_means: list[float]
     gmm_stds: list[float]
     reward_type: str
     reward_center: float
     reward_scale: float
+    reward_bump_centers: list[float]
+    reward_bump_widths: list[float]
+    reward_bump_weights: list[float]
+    reward_sin_amp: float
+    reward_sin_freq: float
+    reward_sin_phase: float
+    reward_l2: float
+    reward_l4: float
     num_samples: int
     seed: int
     diffusion_steps: int
@@ -59,7 +76,11 @@ class LearnedToyConfig:
     snr_max: float
     alpha: float
     beta: float
+    sampler: str
     mala_steps: int
+    mala_eta: float
+    langevin_steps: int
+    langevin_eta: float
     denoising_predictor: str
     guidance_gradient_space: str
     x0_hat_method: str
@@ -131,12 +152,21 @@ def _mish(x: jax.Array) -> jax.Array:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--target_preset", choices=["manual", "complex_1d_v1", "complex_1d_v2"], default="manual")
     p.add_argument("--gmm_weights", default="0.35,0.30,0.35")
     p.add_argument("--gmm_means", default="-0.75,0.0,0.75")
     p.add_argument("--gmm_stds", default="0.10,0.16,0.10")
-    p.add_argument("--reward_type", choices=["quadratic"], default="quadratic")
+    p.add_argument("--reward_type", choices=["quadratic", "bumps", "rugged"], default="quadratic")
     p.add_argument("--reward_center", type=float, default=0.45)
     p.add_argument("--reward_scale", type=float, default=1.0)
+    p.add_argument("--reward_bump_centers", default="-0.72,-0.28,0.18,0.64,0.92")
+    p.add_argument("--reward_bump_widths", default="0.055,0.09,0.06,0.12,0.045")
+    p.add_argument("--reward_bump_weights", default="0.85,-0.45,0.75,1.10,-0.35")
+    p.add_argument("--reward_sin_amp", type=float, default=0.12)
+    p.add_argument("--reward_sin_freq", type=float, default=18.0)
+    p.add_argument("--reward_sin_phase", type=float, default=0.4)
+    p.add_argument("--reward_l2", type=float, default=0.08)
+    p.add_argument("--reward_l4", type=float, default=0.02)
     p.add_argument("--num_samples", type=int, default=20000)
     p.add_argument("--seed", type=int, default=0)
 
@@ -145,7 +175,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snr_max", type=float, default=124.0)
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
+    p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala",
+                   help="Algorithm family: MALA, unadjusted Langevin, or denoising-only DPS/MPGD/unguided.")
     p.add_argument("--mala_steps", type=int, default=4)
+    p.add_argument("--mala_eta", type=float, default=1.0)
+    p.add_argument("--langevin_steps", type=int, default=4)
+    p.add_argument("--langevin_eta", type=float, default=1.0)
     p.add_argument("--denoising_predictor", choices=["Identity", "DDPM_mean", "DDIM"], default="DDPM_mean")
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
     p.add_argument("--x0_hat_method", choices=["tweedie"], default="tweedie",
@@ -175,7 +210,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train_lr", type=float, default=3e-4)
     p.add_argument("--train_log_every", type=int, default=500)
     p.add_argument("--diagnostic_batch_size", type=int, default=20000)
-    return p.parse_args()
+    return _apply_target_preset(p.parse_args())
 
 
 def sample_gmm(key, weights, means, stds, batch_size: int):
@@ -298,7 +333,6 @@ def write_metrics(path: Path, rows: list[dict]) -> None:
         "sample_mean",
         "sample_std",
         "acceptance_rate",
-        "clip_fraction",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -346,18 +380,30 @@ def main() -> None:
     weights = _normalize_weights(_parse_float_list(args.gmm_weights))
     means = np.asarray(_parse_float_list(args.gmm_means), dtype=np.float64)
     stds = np.asarray(_parse_float_list(args.gmm_stds), dtype=np.float64)
+    reward_bump_centers = _parse_float_list(args.reward_bump_centers)
+    reward_bump_widths = _parse_float_list(args.reward_bump_widths)
+    reward_bump_weights = _parse_float_list(args.reward_bump_weights)
     if not (len(weights) == len(means) == len(stds)):
         raise ValueError("GMM weights, means, and stds must have the same length.")
     if np.any(stds <= 0):
         raise ValueError("GMM stds must be positive.")
 
     cfg = LearnedToyConfig(
+        target_preset=args.target_preset,
         gmm_weights=weights.tolist(),
         gmm_means=means.tolist(),
         gmm_stds=stds.tolist(),
         reward_type=args.reward_type,
         reward_center=args.reward_center,
         reward_scale=args.reward_scale,
+        reward_bump_centers=reward_bump_centers,
+        reward_bump_widths=reward_bump_widths,
+        reward_bump_weights=reward_bump_weights,
+        reward_sin_amp=args.reward_sin_amp,
+        reward_sin_freq=args.reward_sin_freq,
+        reward_sin_phase=args.reward_sin_phase,
+        reward_l2=args.reward_l2,
+        reward_l4=args.reward_l4,
         num_samples=args.num_samples,
         seed=args.seed,
         diffusion_steps=args.diffusion_steps,
@@ -365,7 +411,11 @@ def main() -> None:
         snr_max=args.snr_max,
         alpha=args.alpha,
         beta=args.beta,
+        sampler=args.sampler,
         mala_steps=args.mala_steps,
+        mala_eta=args.mala_eta,
+        langevin_steps=args.langevin_steps,
+        langevin_eta=args.langevin_eta,
         denoising_predictor=args.denoising_predictor,
         guidance_gradient_space=args.guidance_gradient_space,
         x0_hat_method=args.x0_hat_method,
@@ -393,6 +443,8 @@ def main() -> None:
         train_log_every=args.train_log_every,
         diagnostic_batch_size=args.diagnostic_batch_size,
     )
+    _validate_reward_params(cfg)
+    _validate_sampler_params(cfg)
 
     if cfg.policy_parameterization == "E" and cfg.policy_final_layer in {"L2", "IP"}:
         warnings.warn(
@@ -437,7 +489,6 @@ def main() -> None:
         "stage": "final_clean",
         "timestep": -1,
         "acceptance_rate": float(np.asarray(result.per_level_acc)[0]),
-        "clip_fraction": float(np.asarray(result.per_level_clip)[0]),
     })
     rows.append(final_metrics)
     panels.append({
@@ -458,7 +509,6 @@ def main() -> None:
         "stage": "final_clipped_action",
         "timestep": -1,
         "acceptance_rate": float("nan"),
-        "clip_fraction": float(np.mean(np.abs(raw_x0) > 1.0)),
     })
     rows.append(clipped_metrics)
 
@@ -482,7 +532,6 @@ def main() -> None:
             "stage": "intermediate",
             "timestep": int(t),
             "acceptance_rate": float(np.asarray(result.per_level_acc)[t]),
-            "clip_fraction": float(np.asarray(result.per_level_clip)[t]),
         })
         rows.append(metrics)
         panels.append({
@@ -502,7 +551,8 @@ def main() -> None:
         out / "plots" / "density_panel.png",
         panels,
         (
-            f"learned diffusion: mala_steps={cfg.mala_steps}, gradient={cfg.guidance_gradient_space}, "
+            f"learned diffusion: sampler={cfg.sampler}, mala_steps={cfg.mala_steps}, "
+            f"langevin_steps={cfg.langevin_steps}, gradient={cfg.guidance_gradient_space}, "
             f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
         ),
     )
@@ -529,7 +579,7 @@ def main() -> None:
         print(
             f"{row['stage']:>20s} t={row['timestep']:>3} "
             f"W1={row['w1']:.5f} KS={row['ks']:.5f} JS={row['js']:.5f} "
-            f"acc={row['acceptance_rate']:.3f} clip={row['clip_fraction']:.3f}"
+            f"acc={row['acceptance_rate']:.3f}"
         )
 
 
