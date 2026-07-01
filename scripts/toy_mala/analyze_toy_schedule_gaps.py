@@ -17,7 +17,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
+import tempfile
 from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(Path(tempfile.gettempdir()) / "xdg-cache"))
 
 import matplotlib
 
@@ -32,22 +37,80 @@ def parse_float_list(text: str) -> list[float]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--target_preset", choices=["manual", "complex_1d_v1", "complex_1d_v2"], default="manual")
     p.add_argument("--schedules", default="linear,cosine,constant_kl")
     p.add_argument("--diffusion_steps", type=int, default=20)
     p.add_argument("--snr_max", type=float, default=124.0)
     p.add_argument("--gmm_weights", default="0.18,0.37,0.25,0.20")
     p.add_argument("--gmm_means", default="-0.85,-0.15,0.10,0.82")
     p.add_argument("--gmm_stds", default="0.09,0.06,0.16,0.08")
+    p.add_argument("--reward_type", choices=["quadratic", "bumps", "rugged"], default="quadratic")
     p.add_argument("--reward_center", type=float, default=0.65)
     p.add_argument("--reward_scale", type=float, default=1.0)
+    p.add_argument("--reward_bump_centers", default="-0.72,-0.28,0.18,0.64,0.92")
+    p.add_argument("--reward_bump_widths", default="0.055,0.09,0.06,0.12,0.045")
+    p.add_argument("--reward_bump_weights", default="0.85,-0.45,0.75,1.10,-0.35")
+    p.add_argument("--reward_sin_amp", type=float, default=0.12)
+    p.add_argument("--reward_sin_freq", type=float, default=18.0)
+    p.add_argument("--reward_sin_phase", type=float, default=0.4)
+    p.add_argument("--reward_l2", type=float, default=0.08)
+    p.add_argument("--reward_l4", type=float, default=0.02)
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
+    p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="posterior_mean")
     p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
     p.add_argument("--grid_min", type=float, default=-6.0)
     p.add_argument("--grid_max", type=float, default=6.0)
     p.add_argument("--grid_points", type=int, default=5001)
     p.add_argument("--out_dir", type=Path, default=Path("toy_schedule_gap_analysis"))
-    return p.parse_args()
+    return apply_target_preset(p.parse_args())
+
+
+def apply_target_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if args.target_preset == "manual":
+        return args
+    if args.target_preset not in {"complex_1d_v1", "complex_1d_v2"}:
+        raise ValueError(f"Unknown target_preset: {args.target_preset}")
+    args.gmm_weights = "0.07,0.18,0.11,0.24,0.08,0.19,0.13"
+    args.gmm_means = "-1.25,-0.82,-0.46,-0.08,0.22,0.61,1.05"
+    args.gmm_stds = "0.055,0.10,0.045,0.15,0.035,0.09,0.06"
+    args.reward_type = "rugged"
+    args.reward_center = 0.45
+    args.reward_scale = 1.0
+    if args.target_preset == "complex_1d_v1":
+        args.reward_bump_centers = "-1.04,-0.58,-0.19,0.36,0.78,1.12"
+        args.reward_bump_widths = "0.06,0.08,0.05,0.10,0.055,0.08"
+        args.reward_bump_weights = "0.75,-0.65,1.05,0.82,-0.55,0.45"
+        args.reward_sin_amp = 0.16
+        args.reward_sin_freq = 22.0
+        args.reward_sin_phase = 0.35
+        args.reward_l2 = 0.07
+        args.reward_l4 = 0.018
+        return args
+
+    args.reward_bump_centers = "-1.04,-0.63,-0.08,0.39,0.61,0.88"
+    args.reward_bump_widths = "0.055,0.055,0.12,0.06,0.10,0.055"
+    args.reward_bump_weights = "3.2,2.4,-3.0,3.0,-2.6,2.8"
+    args.reward_sin_amp = 0.10
+    args.reward_sin_freq = 18.0
+    args.reward_sin_phase = 0.20
+    args.reward_l2 = 0.03
+    args.reward_l4 = 0.01
+    return args
+
+
+def validate_reward_args(args: argparse.Namespace) -> None:
+    if args.reward_type == "quadratic":
+        return
+    centers = parse_float_list(args.reward_bump_centers)
+    widths = parse_float_list(args.reward_bump_widths)
+    weights = parse_float_list(args.reward_bump_weights)
+    if not (len(centers) == len(widths) == len(weights)):
+        raise ValueError("reward_bump_centers, reward_bump_widths, and reward_bump_weights must match.")
+    if len(centers) == 0:
+        raise ValueError("Bump/rugged rewards require at least one bump.")
+    if np.any(np.asarray(widths, dtype=np.float64) <= 0):
+        raise ValueError("reward_bump_widths must be positive.")
 
 
 def normalize_weights(weights: np.ndarray) -> np.ndarray:
@@ -126,7 +189,7 @@ def base_logpdf(grid, weights, means, stds, schedule: dict[str, np.ndarray], t_i
     return logsumexp(log_comp, axis=-1)
 
 
-def x0_hat(grid, weights, means, stds, schedule: dict[str, np.ndarray], t_idx: int) -> np.ndarray:
+def x0_hat(grid, weights, means, stds, schedule: dict[str, np.ndarray], t_idx: int, method: str) -> np.ndarray:
     c = schedule["sqrt_alphas_cumprod"][t_idx]
     sigma = schedule["sqrt_one_minus_alphas_cumprod"][t_idx]
     loc = c * means
@@ -137,14 +200,34 @@ def x0_hat(grid, weights, means, stds, schedule: dict[str, np.ndarray], t_idx: i
         * (np.log(2.0 * np.pi * var)[None, :] + (grid[:, None] - loc[None, :]) ** 2 / var[None, :])
     )
     resp = np.exp(log_comp - logsumexp(log_comp, axis=-1)[:, None])
+    score = np.sum(resp * (-(grid[:, None] - loc[None, :]) / var[None, :]), axis=-1)
+    if method == "tweedie":
+        return (grid + sigma * sigma * score) / c
+    if method != "posterior_mean":
+        raise ValueError(f"Unknown x0_hat_method: {method}")
     posterior_mean = means[None, :] + (c * stds[None, :] ** 2 / var[None, :]) * (
         grid[:, None] - loc[None, :]
     )
     return np.sum(resp * posterior_mean, axis=-1)
 
 
-def reward(a, center: float, scale: float) -> np.ndarray:
-    return -scale * (a - center) ** 2
+def reward(a, args: argparse.Namespace) -> np.ndarray:
+    a = np.asarray(a, dtype=np.float64)
+    if args.reward_type == "quadratic":
+        return -args.reward_scale * (a - args.reward_center) ** 2
+    centers = np.asarray(parse_float_list(args.reward_bump_centers), dtype=np.float64)
+    widths = np.asarray(parse_float_list(args.reward_bump_widths), dtype=np.float64)
+    weights = np.asarray(parse_float_list(args.reward_bump_weights), dtype=np.float64)
+    bumps = np.sum(
+        weights[None, :] * np.exp(-0.5 * ((a[..., None] - centers[None, :]) / widths[None, :]) ** 2),
+        axis=-1,
+    )
+    penalty = args.reward_l2 * a ** 2 + args.reward_l4 * a ** 4
+    if args.reward_type == "bumps":
+        return bumps - penalty
+    if args.reward_type == "rugged":
+        return bumps + args.reward_sin_amp * np.sin(args.reward_sin_freq * a + args.reward_sin_phase) - penalty
+    raise ValueError(f"Unknown reward_type: {args.reward_type}")
 
 
 def normalize_density(log_unnorm: np.ndarray, grid: np.ndarray) -> np.ndarray:
@@ -164,22 +247,18 @@ def target_density(
     t_idx: int | None,
     *,
     guided: bool,
-    alpha: float,
-    beta: float,
-    reward_center: float,
-    reward_scale: float,
-    x0_hat_clip_radius: float,
+    args: argparse.Namespace,
 ):
     base_log = base_logpdf(grid, weights, means, stds, schedule, t_idx)
     if not guided:
-        return normalize_density(alpha * base_log, grid)
+        return normalize_density(args.alpha * base_log, grid)
     if t_idx is None:
         q_arg = grid
     else:
-        q_arg = x0_hat(grid, weights, means, stds, schedule, t_idx)
-        if np.isfinite(x0_hat_clip_radius):
-            q_arg = np.clip(q_arg, -x0_hat_clip_radius, x0_hat_clip_radius)
-    return normalize_density(alpha * base_log + beta * reward(q_arg, reward_center, reward_scale), grid)
+        q_arg = x0_hat(grid, weights, means, stds, schedule, t_idx, args.x0_hat_method)
+        if np.isfinite(args.x0_hat_clip_radius):
+            q_arg = np.clip(q_arg, -args.x0_hat_clip_radius, args.x0_hat_clip_radius)
+    return normalize_density(args.alpha * base_log + args.beta * reward(q_arg, args), grid)
 
 
 def metrics_between(p: np.ndarray, q: np.ndarray, grid: np.ndarray) -> dict[str, float]:
@@ -235,6 +314,7 @@ def save_metric_plot(rows: list[dict], out_dir: Path, metric: str, target_kind: 
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    validate_reward_args(args)
 
     weights = normalize_weights(np.asarray(parse_float_list(args.gmm_weights), dtype=np.float64))
     means = np.asarray(parse_float_list(args.gmm_means), dtype=np.float64)
@@ -258,11 +338,7 @@ def main() -> None:
                     schedule,
                     None,
                     guided=guided,
-                    alpha=args.alpha,
-                    beta=args.beta,
-                    reward_center=args.reward_center,
-                    reward_scale=args.reward_scale,
-                    x0_hat_clip_radius=args.x0_hat_clip_radius,
+                    args=args,
                 )
             ]
             densities.extend(
@@ -274,11 +350,7 @@ def main() -> None:
                     schedule,
                     t,
                     guided=guided,
-                    alpha=args.alpha,
-                    beta=args.beta,
-                    reward_center=args.reward_center,
-                    reward_scale=args.reward_scale,
-                    x0_hat_clip_radius=args.x0_hat_clip_radius,
+                    args=args,
                 )
                 for t in range(args.diffusion_steps)
             )
