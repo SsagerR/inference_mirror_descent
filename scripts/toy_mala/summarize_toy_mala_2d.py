@@ -149,19 +149,25 @@ def predictor_order(name: str) -> int:
     return order.get(name, 99)
 
 
-def panel_title(beta, sampler, eta, gradient) -> str:
+def row_guidance_schedule(row: dict) -> str:
+    return row.get("guidance_schedule") or "constant"
+
+
+def panel_title(beta, sampler, eta, gradient, guidance_schedule="constant") -> str:
     eta_text = f"eta={eta:g}" if eta is not None and np.isfinite(eta) else "eta=?"
     if sampler == "mala":
-        return f"MALA | {gradient}\n{eta_text}, beta={beta:g}"
+        name = "MALA" if guidance_schedule == "constant" else f"MALA + {guidance_schedule}"
+        return f"{name} | {gradient}\n{eta_text}, beta={beta:g}"
     return f"Langevin | {gradient}\n{eta_text}, beta={beta:g}"
 
 
 def algorithm_panel_order(row_key):
-    beta, sampler, eta, gradient = row_key
+    beta, sampler, eta, gradient, guidance_schedule = row_key
     sampler_rank = 0 if sampler == "mala" else 1
+    schedule_rank = {"constant": 0, "alpha_bar": 1}.get(guidance_schedule, 9)
     eta_rank = -1.0 if eta is None or not np.isfinite(eta) else eta
     grad_rank = 0 if gradient == "xt" else 1
-    return (sampler_rank, eta_rank, grad_rank, beta)
+    return (sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
 
 
 def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
@@ -191,13 +197,17 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
     for row in selected:
         sampler = row.get("sampler", "mala") or "mala"
         eta = as_float(row.get("mala_eta", 1.0)) if sampler == "mala" else as_float(row.get("langevin_eta", ""))
-        key = (sampler, eta)
+        key = (sampler, eta, row_guidance_schedule(row))
         if key not in algo_keys:
             algo_keys.append(key)
     sampler_order = {"mala": 0, "langevin": 1}
     algo_keys = sorted(
         algo_keys,
-        key=lambda x: (sampler_order.get(x[0], 99), -1.0 if x[1] is None or not np.isfinite(x[1]) else x[1]),
+        key=lambda x: (
+            sampler_order.get(x[0], 99),
+            {"constant": 0, "alpha_bar": 1}.get(x[2], 9),
+            -1.0 if x[1] is None or not np.isfinite(x[1]) else x[1],
+        ),
     )
     gradients = [g for g in ["xt", "x0hat"] if any(row["guidance_gradient_space"] == g for row in selected)]
     corrector_steps = sorted_unique([
@@ -209,7 +219,12 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         return False
 
     panel_keys = sorted(
-        [(beta, sampler, eta, gradient) for beta in betas for sampler, eta in algo_keys for gradient in gradients],
+        [
+            (beta, sampler, eta, gradient, guidance_schedule)
+            for beta in betas
+            for sampler, eta, guidance_schedule in algo_keys
+            for gradient in gradients
+        ],
         key=algorithm_panel_order,
     )
     ncols = 2
@@ -229,7 +244,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
     vmax = float(np.max(finite_values)) if finite_values.size else None
     image = None
 
-    for ax, (beta, sampler, eta, gradient) in zip(axes.ravel(), panel_keys):
+    for ax, (beta, sampler, eta, gradient, guidance_schedule) in zip(axes.ravel(), panel_keys):
         mat = np.full((len(corrector_steps), len(predictors)), np.nan, dtype=np.float64)
         for row in selected:
             row_sampler = row.get("sampler", "mala") or "mala"
@@ -239,6 +254,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
                 or row_sampler != sampler
                 or row_eta != eta
                 or row["guidance_gradient_space"] != gradient
+                or row_guidance_schedule(row) != guidance_schedule
             ):
                 continue
             step_value = row["langevin_steps"] if row_sampler == "langevin" else row["mala_steps"]
@@ -250,7 +266,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         ax.set_yticks(np.arange(len(corrector_steps)), corrector_steps, fontsize=11)
         ax.set_xlabel("denoising predictor", fontsize=12)
         ax.set_ylabel("corrector steps", fontsize=12)
-        ax.set_title(panel_title(beta, sampler, eta, gradient), fontsize=13, pad=10)
+        ax.set_title(panel_title(beta, sampler, eta, gradient, guidance_schedule), fontsize=13, pad=10)
         for y in range(len(corrector_steps)):
             for x in range(len(predictors)):
                 val = mat[y, x]
@@ -311,6 +327,7 @@ def copy_panels(run_dirs: list[Path], configs: list[dict], out_dir: Path) -> int
         steps = cfg.get("mala_steps") if sampler == "mala" else cfg.get("langevin_steps", "")
         name = (
             f"{sampler}_steps{steps}_eta{eta}_"
+            f"{cfg.get('guidance_schedule', 'constant')}_"
             f"{cfg.get('guidance_gradient_space')}_"
             f"{cfg.get('denoising_predictor')}_"
             f"beta{cfg.get('beta')}_"
@@ -404,6 +421,7 @@ def main() -> None:
                 "langevin_steps": cfg.get("langevin_steps"),
                 "langevin_eta": cfg.get("langevin_eta"),
                 "guidance_gradient_space": cfg.get("guidance_gradient_space"),
+                "guidance_schedule": cfg.get("guidance_schedule", "constant"),
                 "denoising_predictor": cfg.get("denoising_predictor"),
                 "x0_hat_method": cfg.get("x0_hat_method"),
                 "beta": cfg.get("beta"),

@@ -40,6 +40,7 @@ KEY_COLUMNS = [
     "denoising_predictor",
     "x0_hat_method",
     "beta",
+    "guidance_schedule",
     "alpha",
     "beta_schedule_type",
     "snr_max",
@@ -545,19 +546,25 @@ def short_stage_label(stage_key: str) -> str:
     return stage_key.replace("intermediate_", "")
 
 
-def panel_title(beta, sampler, eta, gradient) -> str:
+def row_guidance_schedule(row: dict) -> str:
+    return row.get("guidance_schedule") or "constant"
+
+
+def panel_title(beta, sampler, eta, gradient, guidance_schedule="constant") -> str:
     eta_text = f"eta={eta:g}" if eta is not None and np.isfinite(eta) else "eta=?"
     if sampler == "mala":
-        return f"MALA | {gradient}\n{eta_text}, beta={beta:g}"
+        name = "MALA" if guidance_schedule == "constant" else f"MALA + {guidance_schedule}"
+        return f"{name} | {gradient}\n{eta_text}, beta={beta:g}"
     return f"Langevin | {gradient}\n{eta_text}, beta={beta:g}"
 
 
 def algorithm_panel_order(row_key):
-    beta, sampler, eta, gradient = row_key
+    beta, sampler, eta, gradient, guidance_schedule = row_key
     sampler_rank = 0 if sampler == "mala" else 1
+    schedule_rank = {"constant": 0, "alpha_bar": 1}.get(guidance_schedule, 9)
     eta_rank = -1.0 if eta is None or not np.isfinite(eta) else eta
     grad_rank = 0 if gradient == "xt" else 1
-    return (sampler_rank, eta_rank, grad_rank, beta)
+    return (sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
 
 
 def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
@@ -585,13 +592,17 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
     for row in selected:
         sampler = row.get("sampler", "mala") or "mala"
         eta = as_float(row.get("mala_eta", 1.0)) if sampler == "mala" else as_float(row.get("langevin_eta", ""))
-        key = (sampler, eta)
+        key = (sampler, eta, row_guidance_schedule(row))
         if key not in algo_keys:
             algo_keys.append(key)
     sampler_order = {"mala": 0, "langevin": 1}
     algo_keys = sorted(
         algo_keys,
-        key=lambda x: (sampler_order.get(x[0], 99), -1.0 if x[1] is None or not np.isfinite(x[1]) else x[1]),
+        key=lambda x: (
+            sampler_order.get(x[0], 99),
+            {"constant": 0, "alpha_bar": 1}.get(x[2], 9),
+            -1.0 if x[1] is None or not np.isfinite(x[1]) else x[1],
+        ),
     )
     gradients = [g for g in ["xt", "x0hat"] if any(row["guidance_gradient_space"] == g for row in selected)]
     corrector_steps = sorted_unique([
@@ -603,7 +614,12 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         return False
 
     panel_keys = sorted(
-        [(beta, sampler, eta, gradient) for beta in betas for sampler, eta in algo_keys for gradient in gradients],
+        [
+            (beta, sampler, eta, gradient, guidance_schedule)
+            for beta in betas
+            for sampler, eta, guidance_schedule in algo_keys
+            for gradient in gradients
+        ],
         key=algorithm_panel_order,
     )
     ncols = 2
@@ -622,7 +638,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
     vmin = float(np.min(finite_values)) if finite_values.size else None
     vmax = float(np.max(finite_values)) if finite_values.size else None
     image = None
-    for ax, (beta, sampler, eta, gradient) in zip(axes.ravel(), panel_keys):
+    for ax, (beta, sampler, eta, gradient, guidance_schedule) in zip(axes.ravel(), panel_keys):
         mat = np.full((len(corrector_steps), len(predictors)), np.nan, dtype=np.float64)
         for row in selected:
             row_sampler = row.get("sampler", "mala") or "mala"
@@ -633,6 +649,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
                 or row_sampler != sampler
                 or not eta_matches
                 or row["guidance_gradient_space"] != gradient
+                or row_guidance_schedule(row) != guidance_schedule
             ):
                 continue
             step_value = row["langevin_steps"] if row_sampler == "langevin" else row["mala_steps"]
@@ -644,7 +661,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         ax.set_yticks(np.arange(len(corrector_steps)), corrector_steps, fontsize=11)
         ax.set_xlabel("denoising predictor", fontsize=12)
         ax.set_ylabel("corrector steps", fontsize=12)
-        ax.set_title(panel_title(beta, sampler, eta, gradient), fontsize=13, pad=10)
+        ax.set_title(panel_title(beta, sampler, eta, gradient, guidance_schedule), fontsize=13, pad=10)
         for y in range(len(corrector_steps)):
             for x in range(len(predictors)):
                 val = mat[y, x]
@@ -731,13 +748,18 @@ def save_quality_curve(rows: list[dict], metric: str, stage_key: str, out_path: 
             sampler = row.get("sampler", "mala") or "mala"
             gradient = row["guidance_gradient_space"]
             eta = as_float(row.get("mala_eta", 1.0)) if sampler == "mala" else as_float(row.get("langevin_eta", ""))
-            key = (sampler, eta, gradient)
+            key = (sampler, eta, gradient, row_guidance_schedule(row))
             step_value = row["langevin_steps"] if sampler == "langevin" else row["mala_steps"]
             groups.setdefault(key, []).append((int(float(step_value)), as_float(row[metric])))
 
-        for (sampler, eta, gradient), points in sorted(
+        for (sampler, eta, gradient, guidance_schedule), points in sorted(
             groups.items(),
-            key=lambda item: (0 if item[0][0] == "mala" else 1, -1 if item[0][1] is None else item[0][1], item[0][2]),
+            key=lambda item: (
+                0 if item[0][0] == "mala" else 1,
+                {"constant": 0, "alpha_bar": 1}.get(item[0][3], 9),
+                -1 if item[0][1] is None else item[0][1],
+                item[0][2],
+            ),
         ):
             points = sorted(points)
             xs = [p[0] for p in points]
@@ -745,8 +767,11 @@ def save_quality_curve(rows: list[dict], metric: str, stage_key: str, out_path: 
             if not xs:
                 continue
             eta_label = f" eta={eta:g}" if eta is not None and np.isfinite(eta) else ""
-            label = f"{sampler}{eta_label} {gradient}"
-            color_idx = abs(hash((sampler, round(float(eta), 8) if np.isfinite(eta) else None, gradient))) % max(len(color_cycle), 1)
+            sampler_label = sampler if guidance_schedule == "constant" else f"{sampler}+{guidance_schedule}"
+            label = f"{sampler_label}{eta_label} {gradient}"
+            color_idx = abs(
+                hash((sampler, guidance_schedule, round(float(eta), 8) if np.isfinite(eta) else None, gradient))
+            ) % max(len(color_cycle), 1)
             color = color_cycle[color_idx] if color_cycle else None
             ax.plot(xs, ys, marker="o", label=label, color=color)
             any_line = True
@@ -942,6 +967,7 @@ def main():
             "denoising_predictor": cfg.denoising_predictor,
             "x0_hat_method": get_cfg_attr(cfg, "x0_hat_method", "posterior_mean"),
             "beta": cfg.beta,
+            "guidance_schedule": get_cfg_attr(cfg, "guidance_schedule", "constant"),
             "alpha": cfg.alpha,
             "beta_schedule_type": cfg.beta_schedule_type,
             "snr_max": cfg.snr_max,

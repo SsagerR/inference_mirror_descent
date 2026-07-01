@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from relax.utils.diffusion import build_beta_schedule
+from scripts.toy_mala.guidance_schedule import GUIDANCE_SCHEDULE_CHOICES, guidance_schedule_multiplier
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class Toy2DConfig:
     snr_max: float
     alpha: float
     beta: float
+    guidance_schedule: str
     sampler: str
     mala_steps: int
     mala_eta: float
@@ -276,6 +278,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--snr_max", type=float, default=124.0)
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
+    p.add_argument("--guidance_schedule", choices=GUIDANCE_SCHEDULE_CHOICES, default="constant",
+                   help="Per-level guidance multiplier. constant is the current behavior; alpha_bar multiplies guidance by alpha_bar_t.")
     p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala",
                    help="Algorithm family: MALA, unadjusted Langevin, or DDIM-only references.")
     p.add_argument("--mala_steps", type=int, default=4)
@@ -707,7 +711,11 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
         guidance_gradient_space = "x0hat"
     else:
         guidance_gradient_space = cfg.guidance_gradient_space
-    denoising_beta = jnp.float32(0.0) if sampler == "unguided" else beta_current
+    def guidance_beta(t_idx):
+        if sampler == "unguided":
+            return jnp.float32(0.0)
+        multiplier = guidance_schedule_multiplier(cfg.guidance_schedule, schedule.alphas_cumprod, t_idx)
+        return beta_current * jnp.asarray(multiplier, dtype=jnp.float32)
 
     def q_at_clipped_x0_hat(x0_hat):
         x0_clipped = jnp.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
@@ -731,7 +739,8 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
         (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
         x0_hat = base_x0_hat(x, t_idx)
         clip_frac = jnp.mean(jnp.any(jnp.abs(x0_hat) > cfg.x0_hat_clip_radius, axis=-1).astype(jnp.float32))
-        return jnp.float32(cfg.alpha) * E_vals - beta_current * q_at_clipped_x0_hat(x0_hat), clip_frac
+        beta_t = guidance_beta(t_idx)
+        return jnp.float32(cfg.alpha) * E_vals - beta_t * q_at_clipped_x0_hat(x0_hat), clip_frac
 
     def guidance_value_from_x(x_in, t_idx):
         x0_hat = base_x0_hat(x_in, t_idx)
@@ -771,8 +780,9 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
             grad_q = jax.grad(lambda action: jnp.sum(model.q(None, None, action)))(
                 jax.lax.stop_gradient(x0_clipped)
             )
-        energy = jnp.float32(cfg.alpha) * E_vals - beta_current * q
-        grad_energy = jnp.float32(cfg.alpha) * e_grad - beta_current * grad_q
+        beta_t = guidance_beta(t_idx)
+        energy = jnp.float32(cfg.alpha) * E_vals - beta_t * q
+        grad_energy = jnp.float32(cfg.alpha) * e_grad - beta_t * grad_q
         clip_frac = jnp.mean(jnp.any(jnp.abs(x0_hat) > cfg.x0_hat_clip_radius, axis=-1).astype(jnp.float32))
         return energy, grad_energy, clip_frac
 
@@ -781,11 +791,12 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
         grad_q = compute_guidance_gradient(x_in, t_idx)
         sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
         c_t = schedule.sqrt_alphas_cumprod[t_idx]
-        eps_guided = jnp.float32(cfg.alpha) * eps_base - denoising_beta * sigma_t * grad_q
+        beta_t = guidance_beta(t_idx)
+        eps_guided = jnp.float32(cfg.alpha) * eps_base - beta_t * sigma_t * grad_q
         x0_guided = (
             jnp.float32(cfg.alpha) * base_x0_hat(x_in, t_idx)
             + (jnp.float32(1.0) - jnp.float32(cfg.alpha)) * x_in / c_t
-            + denoising_beta * (sigma_t * sigma_t / c_t) * grad_q
+            + beta_t * (sigma_t * sigma_t / c_t) * grad_q
         )
         return x0_guided, eps_guided
 
@@ -964,6 +975,7 @@ def main() -> None:
         snr_max=args.snr_max,
         alpha=args.alpha,
         beta=args.beta,
+        guidance_schedule=args.guidance_schedule,
         sampler=args.sampler,
         mala_steps=args.mala_steps,
         mala_eta=args.mala_eta,

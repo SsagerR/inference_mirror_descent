@@ -12,10 +12,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, NamedTuple
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from relax.utils.diffusion import build_beta_schedule
+from scripts.toy_mala.guidance_schedule import GUIDANCE_SCHEDULE_CHOICES, guidance_schedule_multiplier
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,7 @@ class ToyConfig:
     snr_max: float
     alpha: float
     beta: float
+    guidance_schedule: str
     sampler: str
     mala_steps: int
     mala_eta: float
@@ -233,6 +240,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--snr_max", type=float, default=124.0)
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
+    p.add_argument("--guidance_schedule", choices=GUIDANCE_SCHEDULE_CHOICES, default="constant",
+                   help="Per-level guidance multiplier. constant is the current behavior; alpha_bar multiplies guidance by alpha_bar_t.")
     p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala",
                    help="Algorithm family: MALA, unadjusted Langevin, or denoising-only DPS/MPGD/unguided.")
     p.add_argument("--mala_steps", type=int, default=4)
@@ -526,7 +535,11 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         guidance_gradient_space = "x0hat"
     else:
         guidance_gradient_space = cfg.guidance_gradient_space
-    denoising_beta = jnp.float32(0.0) if sampler == "unguided" else beta_current
+    def guidance_beta(t_idx):
+        if sampler == "unguided":
+            return jnp.float32(0.0)
+        multiplier = guidance_schedule_multiplier(cfg.guidance_schedule, schedule.alphas_cumprod, t_idx)
+        return beta_current * jnp.asarray(multiplier, dtype=jnp.float32)
 
     def reconstruct_x0_from_noise(x_in, t_idx, noise_pred):
         return (
@@ -573,7 +586,8 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         (e_grad,) = vjp_fn(jnp.ones_like(E_vals))
         x0_hat = base_x0_hat(x, t_idx)
         clip_frac = jnp.mean((jnp.abs(x0_hat) > cfg.x0_hat_clip_radius).astype(jnp.float32))
-        return jnp.float32(cfg.alpha) * E_vals - beta_current * q_at_clipped_x0_hat(x0_hat), clip_frac
+        beta_t = guidance_beta(t_idx)
+        return jnp.float32(cfg.alpha) * E_vals - beta_t * q_at_clipped_x0_hat(x0_hat), clip_frac
 
     def guidance_value_from_x(x_in, t_idx):
         x0_hat = base_x0_hat(x_in, t_idx)
@@ -615,8 +629,9 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
             grad_q = jax.grad(lambda action: jnp.sum(q_value(action)))(
                 jax.lax.stop_gradient(x0_clipped)
             )
-        energy = jnp.float32(cfg.alpha) * E_vals - beta_current * q
-        grad_energy = jnp.float32(cfg.alpha) * e_grad - beta_current * grad_q
+        beta_t = guidance_beta(t_idx)
+        energy = jnp.float32(cfg.alpha) * E_vals - beta_t * q
+        grad_energy = jnp.float32(cfg.alpha) * e_grad - beta_t * grad_q
         clip_frac = jnp.mean((jnp.abs(x0_hat) > cfg.x0_hat_clip_radius).astype(jnp.float32))
         return energy, grad_energy, clip_frac
 
@@ -624,20 +639,21 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         noise_pred_scaled = jnp.float32(cfg.alpha) * model.eps_pred(None, None, x_in, t_idx)
         grad_q = compute_guidance_gradient(x_in, t_idx)
         sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
-        return noise_pred_scaled - denoising_beta * sigma_t * grad_q
+        return noise_pred_scaled - guidance_beta(t_idx) * sigma_t * grad_q
 
     def guided_x0_and_eps(t_idx, x_in):
         eps_base = model.eps_pred(None, None, x_in, t_idx)
         grad_q = compute_guidance_gradient(x_in, t_idx)
         sigma_t = schedule.sqrt_one_minus_alphas_cumprod[t_idx]
         sqrt_ab_t = schedule.sqrt_alphas_cumprod[t_idx]
-        eps_guided = jnp.float32(cfg.alpha) * eps_base - denoising_beta * sigma_t * grad_q
+        beta_t = guidance_beta(t_idx)
+        eps_guided = jnp.float32(cfg.alpha) * eps_base - beta_t * sigma_t * grad_q
         # Algebraically equal to reconstruct_x0_from_noise(x, t, eps_guided),
         # but uses the closed-form oracle E[x0 | x_t] to avoid high-noise cancellation.
         x0_guided = (
             jnp.float32(cfg.alpha) * base_x0_hat(x_in, t_idx)
             + (jnp.float32(1.0) - jnp.float32(cfg.alpha)) * x_in / sqrt_ab_t
-            + denoising_beta * (sigma_t * sigma_t / sqrt_ab_t) * grad_q
+            + beta_t * (sigma_t * sigma_t / sqrt_ab_t) * grad_q
         )
         return x0_guided, eps_guided
 
@@ -836,6 +852,7 @@ def main() -> None:
         snr_max=args.snr_max,
         alpha=args.alpha,
         beta=args.beta,
+        guidance_schedule=args.guidance_schedule,
         sampler=args.sampler,
         mala_steps=args.mala_steps,
         mala_eta=args.mala_eta,
