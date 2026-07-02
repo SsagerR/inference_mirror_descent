@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from relax.utils.diffusion import build_beta_schedule
+from scripts.toy_mala.denoising_schedule import DENOISING_SCHEDULE_CHOICES, denoising_predictor_for_step
 from scripts.toy_mala.guidance_schedule import GUIDANCE_SCHEDULE_CHOICES, guidance_schedule_multiplier
 from scripts.toy_mala.mala_step_schedule import MALA_STEP_SCHEDULE_CHOICES, allocate_mala_steps
 
@@ -68,6 +69,7 @@ class ToyConfig:
     langevin_steps: int
     langevin_eta: float
     denoising_predictor: str
+    denoising_schedule: str
     guidance_gradient_space: str
     x0_hat_method: str
     x0_hat_clip_radius: float
@@ -259,6 +261,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--langevin_eta", type=float, default=1.0,
                    help="Fixed Langevin step multiplier: eta_t = langevin_eta * beta_t, clipped to [1e-8, 0.5].")
     p.add_argument("--denoising_predictor", choices=["Identity", "DDPM_mean", "DDIM"], default="DDPM_mean")
+    p.add_argument("--denoising_schedule", choices=DENOISING_SCHEDULE_CHOICES, default="from_predictor",
+                   help="Per-level denoising predictor schedule. from_predictor preserves --denoising_predictor.")
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
     p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="tweedie",
                    help="Use tweedie by default: oracle score/epsilon followed by the standard x0 reconstruction formula.")
@@ -680,16 +684,15 @@ def run_toy_mala_sampler(key: jax.Array, model: ToyModel, cfg: ToyConfig) -> Toy
         sqrt_one_minus_ab_prev = jnp.sqrt(1.0 - schedule.alphas_cumprod_prev[t_idx])
         return sqrt_ab_prev * x0_guided + sqrt_one_minus_ab_prev * eps_pred
 
-    if cfg.denoising_predictor == "Identity":
-        def denoising_step(t_idx, x_curr):
-            del t_idx
+    def denoising_step(t_idx, x_curr):
+        predictor = denoising_predictor_for_step(cfg.denoising_schedule, cfg.denoising_predictor, t_idx)
+        if predictor == "Identity":
             return x_curr
-    elif cfg.denoising_predictor == "DDPM_mean":
-        denoising_step = ddpm_mean_step
-    elif cfg.denoising_predictor == "DDIM":
-        denoising_step = ddim_step
-    else:
-        raise ValueError(f"Unknown denoising_predictor: {cfg.denoising_predictor}")
+        if predictor == "DDPM_mean":
+            return ddpm_mean_step(t_idx, x_curr)
+        if predictor == "DDIM":
+            return ddim_step(t_idx, x_curr)
+        raise ValueError(f"Unknown denoising predictor from schedule: {predictor}")
 
     log_eta_min = jnp.log(jnp.float32(1e-8) / jnp.maximum(jnp.max(schedule.betas), jnp.float32(1e-8)))
     log_eta_max = jnp.log(jnp.float32(0.5) / jnp.maximum(jnp.min(schedule.betas), jnp.float32(1e-8)))
@@ -871,6 +874,7 @@ def main() -> None:
         langevin_steps=args.langevin_steps,
         langevin_eta=args.langevin_eta,
         denoising_predictor=args.denoising_predictor,
+        denoising_schedule=args.denoising_schedule,
         guidance_gradient_space=args.guidance_gradient_space,
         x0_hat_method=args.x0_hat_method,
         x0_hat_clip_radius=args.x0_hat_clip_radius,
@@ -1002,7 +1006,7 @@ def main() -> None:
             f"sampler={cfg.sampler}, mala_schedule={cfg.mala_step_schedule}, budget={cfg.mala_budget}, "
             f"mala_steps={cfg.mala_steps}, langevin_steps={cfg.langevin_steps}, "
             f"gradient={cfg.guidance_gradient_space}, "
-            f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
+            f"predictor={cfg.denoising_predictor}, denoise_schedule={cfg.denoising_schedule}, beta={cfg.beta}"
         ),
     )
 

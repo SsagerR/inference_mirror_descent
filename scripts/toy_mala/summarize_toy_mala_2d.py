@@ -428,6 +428,7 @@ def main() -> None:
                 "guidance_gradient_space": cfg.get("guidance_gradient_space"),
                 "guidance_schedule": cfg.get("guidance_schedule", "constant"),
                 "denoising_predictor": cfg.get("denoising_predictor"),
+                "denoising_schedule": cfg.get("denoising_schedule", "from_predictor"),
                 "x0_hat_method": cfg.get("x0_hat_method"),
                 "beta": cfg.get("beta"),
                 "beta_schedule_type": cfg.get("beta_schedule_type"),
