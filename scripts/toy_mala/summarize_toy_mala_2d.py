@@ -417,6 +417,11 @@ def main() -> None:
                 "target_preset": cfg.get("target_preset"),
                 "sampler": cfg.get("sampler", "mala"),
                 "mala_steps": cfg.get("mala_steps"),
+                "mala_budget": cfg.get("mala_budget", cfg.get("mala_steps", 0) * cfg.get("diffusion_steps", 0)),
+                "mala_step_schedule": cfg.get("mala_step_schedule", "constant"),
+                "mala_steps_per_level": json.dumps(
+                    cfg.get("mala_steps_per_level", [cfg.get("mala_steps", "")] * int(cfg.get("diffusion_steps", 0)))
+                ),
                 "mala_eta": cfg.get("mala_eta"),
                 "langevin_steps": cfg.get("langevin_steps"),
                 "langevin_eta": cfg.get("langevin_eta"),

@@ -14,7 +14,7 @@ import csv
 import json
 import sys
 import warnings
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import NamedTuple
 
@@ -32,6 +32,7 @@ import numpy as np
 
 from relax.utils.diffusion import build_beta_schedule
 from scripts.toy_mala.guidance_schedule import GUIDANCE_SCHEDULE_CHOICES, guidance_schedule_multiplier
+from scripts.toy_mala.mala_step_schedule import MALA_STEP_SCHEDULE_CHOICES, allocate_mala_steps
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,9 @@ class Toy2DConfig:
     guidance_schedule: str
     sampler: str
     mala_steps: int
+    mala_budget: int
+    mala_step_schedule: str
+    mala_steps_per_level: list[int]
     mala_eta: float
     langevin_steps: int
     langevin_eta: float
@@ -283,6 +287,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala",
                    help="Algorithm family: MALA, unadjusted Langevin, or DDIM-only references.")
     p.add_argument("--mala_steps", type=int, default=4)
+    p.add_argument("--mala_budget", type=int, default=None,
+                   help="Total MALA step budget across diffusion levels. Defaults to mala_steps * diffusion_steps.")
+    p.add_argument("--mala_step_schedule", choices=MALA_STEP_SCHEDULE_CHOICES, default="constant",
+                   help="How to allocate mala_budget across diffusion levels.")
     p.add_argument("--mala_eta", type=float, default=1.0,
                    help="Initial/fixed MALA step multiplier: eta_t = mala_eta * beta_t when mala_adapt_rate=0.")
     p.add_argument("--langevin_steps", type=int, default=4)
@@ -864,14 +872,15 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
             log_eta_scale = jnp.clip(log_eta_scale, log_eta_min, log_eta_max)
             return x_next, rng_step, log_eta_scale, accept_rate_sum + acc_rate, clip_frac_sum + clip_x
 
+        mala_steps_t = int(cfg.mala_steps_per_level[t_idx])
         mala_x_t, rng_out, log_eta_scale_new, acc_sum, clip_sum = jax.lax.fori_loop(
             0,
-            cfg.mala_steps,
+            mala_steps_t,
             mala_body,
             (x_t, rng, log_eta_scales[t_idx], jnp.float32(0.0), jnp.float32(0.0)),
         )
         log_eta_scales = log_eta_scales.at[t_idx].set(log_eta_scale_new)
-        denom = jnp.maximum(jnp.float32(cfg.mala_steps), jnp.float32(1.0))
+        denom = jnp.maximum(jnp.float32(mala_steps_t), jnp.float32(1.0))
         return mala_x_t, rng_out, log_eta_scales, acc_sum / denom, clip_sum / denom
 
     def run_langevin_chain_at_level(t_idx, x_t, rng):
@@ -978,6 +987,9 @@ def main() -> None:
         guidance_schedule=args.guidance_schedule,
         sampler=args.sampler,
         mala_steps=args.mala_steps,
+        mala_budget=args.mala_budget if args.mala_budget is not None else args.mala_steps * args.diffusion_steps,
+        mala_step_schedule=args.mala_step_schedule,
+        mala_steps_per_level=[],
         mala_eta=args.mala_eta,
         langevin_steps=args.langevin_steps,
         langevin_eta=args.langevin_eta,
@@ -1011,12 +1023,20 @@ def main() -> None:
             RuntimeWarning,
         )
 
+    schedule = build_beta_schedule(cfg.diffusion_steps, cfg.beta_schedule_type, cfg.snr_max)
+    mala_steps_per_level = allocate_mala_steps(
+        cfg.mala_step_schedule,
+        diffusion_steps=cfg.diffusion_steps,
+        mala_budget=cfg.mala_budget,
+        sqrt_alphas_cumprod=np.asarray(schedule.sqrt_alphas_cumprod),
+        mala_steps=cfg.mala_steps,
+    )
+    cfg = replace(cfg, mala_budget=int(sum(mala_steps_per_level)), mala_steps_per_level=list(mala_steps_per_level))
+
     out = Path(cfg.output_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "plots").mkdir(exist_ok=True)
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True))
-
-    schedule = build_beta_schedule(cfg.diffusion_steps, cfg.beta_schedule_type, cfg.snr_max)
     model = Toy2DModel(
         weights=jnp.asarray(weights, dtype=jnp.float32),
         means=jnp.asarray(means, dtype=jnp.float32),
@@ -1164,7 +1184,8 @@ def main() -> None:
         out / "plots" / "contour_panel.png",
         panels,
         (
-            f"sampler={cfg.sampler}, mala_steps={cfg.mala_steps}, langevin_steps={cfg.langevin_steps}, "
+            f"sampler={cfg.sampler}, mala_schedule={cfg.mala_step_schedule}, budget={cfg.mala_budget}, "
+            f"mala_steps={cfg.mala_steps}, langevin_steps={cfg.langevin_steps}, "
             f"mala_eta={cfg.mala_eta}, langevin_eta={cfg.langevin_eta}, gradient={cfg.guidance_gradient_space}, "
             f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
         ),
@@ -1178,6 +1199,7 @@ def main() -> None:
         eval_timesteps=np.asarray(eval_ts, dtype=np.int32),
         per_level_acc=np.asarray(result.per_level_acc),
         per_level_clip=np.asarray(result.per_level_clip),
+        mala_steps_per_level=np.asarray(cfg.mala_steps_per_level, dtype=np.int32),
         log_eta_scales=np.asarray(result.log_eta_scales),
     )
 

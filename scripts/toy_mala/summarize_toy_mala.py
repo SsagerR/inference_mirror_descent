@@ -33,6 +33,9 @@ KEY_COLUMNS = [
     "reward_type",
     "sampler",
     "mala_steps",
+    "mala_budget",
+    "mala_step_schedule",
+    "mala_steps_per_level",
     "mala_eta",
     "langevin_steps",
     "langevin_eta",
@@ -960,6 +963,11 @@ def main():
             "reward_type": get_cfg_attr(cfg, "reward_type", "quadratic"),
             "sampler": get_cfg_attr(cfg, "sampler", "mala"),
             "mala_steps": cfg.mala_steps,
+            "mala_budget": get_cfg_attr(cfg, "mala_budget", cfg.mala_steps * cfg.diffusion_steps),
+            "mala_step_schedule": get_cfg_attr(cfg, "mala_step_schedule", "constant"),
+            "mala_steps_per_level": json.dumps(
+                get_cfg_attr(cfg, "mala_steps_per_level", [cfg.mala_steps] * cfg.diffusion_steps)
+            ),
             "mala_eta": get_cfg_attr(cfg, "mala_eta", 1.0),
             "langevin_steps": get_cfg_attr(cfg, "langevin_steps", ""),
             "langevin_eta": get_cfg_attr(cfg, "langevin_eta", ""),
