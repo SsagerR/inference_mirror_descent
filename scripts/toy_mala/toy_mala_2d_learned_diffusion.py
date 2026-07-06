@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""1D toy MALA experiment with a learned diffusion policy.
+"""2D toy MALA experiment with a learned diffusion policy.
 
-This script keeps the 1D oracle GMM/Q/evaluation setup from toy_mala_1d.py,
-but replaces the oracle diffusion energy/score used by the sampler with the
-repo's existing ActorCritic diffusion-policy architecture trained by eps-MSE.
-
-The Q function and evaluation target remain oracle. This isolates the effect
-of learned diffusion model error while keeping the rest of the toy experiment
-close to the production MALA sampler.
+This is the learned-score analogue of ``toy_mala_2d.py``.  The target GMM,
+reward, MALA sampler, denoising logic, metrics, and plots stay aligned with
+the oracle 2D script; only the diffusion base model is replaced by an
+ActorCritic diffusion policy trained by epsilon MSE.
 """
 
 from __future__ import annotations
@@ -19,7 +16,10 @@ import sys
 import warnings
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Iterable
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import jax
 import jax.numpy as jnp
@@ -30,46 +30,51 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optax
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from relax.network.actor_critic import ActorCritic
-from scripts.toy_mala.toy_mala_1d import (
-    _apply_target_preset,
-    _eval_timesteps,
-    _normalize_weights,
-    _parse_float_list,
-    _validate_sampler_params,
-    _validate_reward_params,
-    make_eval_grid,
-    metrics_from_samples,
-    np_x0_hat,
-    run_toy_mala_sampler,
-    save_density_panel,
-    save_density_plot,
-    target_density,
-)
 from scripts.toy_mala.denoising_schedule import DENOISING_SCHEDULE_CHOICES
 from scripts.toy_mala.guidance_schedule import GUIDANCE_SCHEDULE_CHOICES
 from scripts.toy_mala.mala_step_schedule import MALA_STEP_SCHEDULE_CHOICES, allocate_mala_steps
+from scripts.toy_mala.toy_mala_2d import (
+    apply_target_preset,
+    eval_timesteps,
+    jax_reward,
+    make_covariances,
+    make_eval_grid,
+    metrics_from_samples,
+    normalize_weights,
+    np_base_logpdf,
+    np_reward,
+    np_x0_hat,
+    parse_float_list,
+    parse_matrix_rows,
+    parse_vector,
+    run_toy_mala_sampler,
+    save_contour_panel,
+    save_contour_plot,
+    save_orig_target_comparison,
+    save_surface_plot,
+    target_density_grid,
+    validate_reward_params,
+    validate_sampler_params,
+)
 
 
 @dataclass(frozen=True)
-class LearnedToyConfig:
+class LearnedToy2DConfig:
     score_source: str
     target_preset: str
     gmm_weights: list[float]
-    gmm_means: list[float]
-    gmm_stds: list[float]
+    gmm_means: list[list[float]]
+    gmm_stds: list[list[float]]
+    gmm_corrs: list[float]
     reward_type: str
-    reward_center: float
-    reward_scale: float
-    reward_bump_centers: list[float]
-    reward_bump_widths: list[float]
+    reward_center: list[float]
+    reward_scales: list[float]
+    reward_bump_centers: list[list[float]]
+    reward_bump_widths: list[list[float]]
     reward_bump_weights: list[float]
     reward_sin_amp: float
-    reward_sin_freq: float
+    reward_sin_freqs: list[float]
     reward_sin_phase: float
     reward_l2: float
     reward_l4: float
@@ -105,6 +110,8 @@ class LearnedToyConfig:
     grid_min: float
     grid_max: float
     grid_points: int
+    metric_target_samples: int
+    metric_slices: int
     eval_timesteps: str
     output_dir: str
 
@@ -121,16 +128,25 @@ class LearnedToyConfig:
 
 
 @dataclass
-class LearnedToyModel:
+class LearnedToy2DModel:
     actor: ActorCritic
     policy_params: object
-    reward_center: float
-    reward_scale: float
+    reward_type: str
+    reward_center: jax.Array
+    reward_scales: jax.Array
+    reward_bump_centers: jax.Array
+    reward_bump_widths: jax.Array
+    reward_bump_weights: jax.Array
+    reward_sin_amp: float
+    reward_sin_freqs: jax.Array
+    reward_sin_phase: float
+    reward_l2: float
+    reward_l4: float
     schedule: object
     num_timesteps: int
     mala_steps: int
     x_recon_clip_radius: float
-    act_dim: int = 1
+    act_dim: int = 2
 
     def _obs_like(self, act):
         return jnp.zeros((*act.shape[:-1], 1), dtype=act.dtype)
@@ -152,8 +168,20 @@ class LearnedToyModel:
 
     def q(self, params, obs, act):
         del params, obs
-        a = act[..., 0]
-        return -self.reward_scale * (a - self.reward_center) ** 2
+        return jax_reward(
+            act,
+            self.reward_type,
+            self.reward_center,
+            self.reward_scales,
+            self.reward_bump_centers,
+            self.reward_bump_widths,
+            self.reward_bump_weights,
+            self.reward_sin_amp,
+            self.reward_sin_freqs,
+            self.reward_sin_phase,
+            self.reward_l2,
+            self.reward_l4,
+        )
 
 
 def _mish(x: jax.Array) -> jax.Array:
@@ -162,21 +190,23 @@ def _mish(x: jax.Array) -> jax.Array:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--target_preset", choices=["manual", "complex_1d_v1", "complex_1d_v2"], default="manual")
-    p.add_argument("--gmm_weights", default="0.35,0.30,0.35")
-    p.add_argument("--gmm_means", default="-0.75,0.0,0.75")
-    p.add_argument("--gmm_stds", default="0.10,0.16,0.10")
+    p.add_argument("--target_preset", choices=["manual", "complex_2d_v1", "complex_2d_v2"], default="complex_2d_v2",
+                   help="manual uses provided flags; complex_2d_v2 is the recommended hard 2D target.")
+    p.add_argument("--gmm_weights", default="0.18,0.37,0.25,0.20")
+    p.add_argument("--gmm_means", default="-0.85,-0.45;-0.15,0.18;0.10,-0.05;0.82,0.52")
+    p.add_argument("--gmm_stds", default="0.09,0.14;0.06,0.10;0.16,0.07;0.08,0.11")
+    p.add_argument("--gmm_corrs", default="0.20,-0.35,0.40,-0.20")
     p.add_argument("--reward_type", choices=["quadratic", "bumps", "rugged"], default="quadratic")
-    p.add_argument("--reward_center", type=float, default=0.45)
-    p.add_argument("--reward_scale", type=float, default=1.0)
-    p.add_argument("--reward_bump_centers", default="-0.72,-0.28,0.18,0.64,0.92")
-    p.add_argument("--reward_bump_widths", default="0.055,0.09,0.06,0.12,0.045")
-    p.add_argument("--reward_bump_weights", default="0.85,-0.45,0.75,1.10,-0.35")
-    p.add_argument("--reward_sin_amp", type=float, default=0.12)
-    p.add_argument("--reward_sin_freq", type=float, default=18.0)
-    p.add_argument("--reward_sin_phase", type=float, default=0.4)
-    p.add_argument("--reward_l2", type=float, default=0.08)
-    p.add_argument("--reward_l4", type=float, default=0.02)
+    p.add_argument("--reward_center", default="0.65,0.35")
+    p.add_argument("--reward_scales", default="1.0,1.0")
+    p.add_argument("--reward_bump_centers", default="0.55,0.28;-0.25,0.20;0.82,0.58")
+    p.add_argument("--reward_bump_widths", default="0.16,0.14;0.20,0.12;0.12,0.16")
+    p.add_argument("--reward_bump_weights", default="1.2,-0.7,0.8")
+    p.add_argument("--reward_sin_amp", type=float, default=0.10)
+    p.add_argument("--reward_sin_freqs", default="8.0,11.0")
+    p.add_argument("--reward_sin_phase", type=float, default=0.2)
+    p.add_argument("--reward_l2", type=float, default=0.05)
+    p.add_argument("--reward_l4", type=float, default=0.006)
     p.add_argument("--num_samples", type=int, default=20000)
     p.add_argument("--seed", type=int, default=0)
 
@@ -186,19 +216,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--beta", type=float, default=1.0)
     p.add_argument("--guidance_schedule", choices=GUIDANCE_SCHEDULE_CHOICES, default="constant")
-    p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala",
-                   help="Algorithm family: MALA, unadjusted Langevin, or denoising-only DPS/MPGD/unguided.")
+    p.add_argument("--sampler", choices=["mala", "langevin", "dps", "mpgd", "unguided"], default="mala")
     p.add_argument("--mala_steps", type=int, default=4)
     p.add_argument("--mala_budget", type=int, default=None,
                    help="Total MALA step budget across diffusion levels. Defaults to mala_steps * diffusion_steps.")
-    p.add_argument("--mala_step_schedule", choices=MALA_STEP_SCHEDULE_CHOICES, default="constant",
-                   help="How to allocate mala_budget across diffusion levels.")
+    p.add_argument("--mala_step_schedule", choices=MALA_STEP_SCHEDULE_CHOICES, default="constant")
     p.add_argument("--mala_eta", type=float, default=1.0)
     p.add_argument("--langevin_steps", type=int, default=4)
     p.add_argument("--langevin_eta", type=float, default=1.0)
     p.add_argument("--denoising_predictor", choices=["Identity", "DDPM_mean", "DDIM"], default="DDPM_mean")
-    p.add_argument("--denoising_schedule", choices=DENOISING_SCHEDULE_CHOICES, default="from_predictor",
-                   help="Per-level denoising predictor schedule. from_predictor preserves --denoising_predictor.")
+    p.add_argument("--denoising_schedule", choices=DENOISING_SCHEDULE_CHOICES, default="from_predictor")
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
     p.add_argument("--x0_hat_method", choices=["tweedie"], default="tweedie",
                    help="Learned diffusion has no closed-form posterior mean; use production-style Tweedie.")
@@ -215,9 +242,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0)
 
     p.add_argument("--grid_mode", choices=["auto", "fixed"], default="auto")
-    p.add_argument("--grid_min", type=float, default=-6.0)
-    p.add_argument("--grid_max", type=float, default=6.0)
-    p.add_argument("--grid_points", type=int, default=2001)
+    p.add_argument("--grid_min", type=float, default=-3.0)
+    p.add_argument("--grid_max", type=float, default=3.0)
+    p.add_argument("--grid_points", type=int, default=181)
+    p.add_argument("--metric_target_samples", type=int, default=20000)
+    p.add_argument("--metric_slices", type=int, default=64)
     p.add_argument("--eval_timesteps", default="auto")
     p.add_argument("--output_dir", type=str, required=True)
 
@@ -231,23 +260,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train_lr", type=float, default=3e-4)
     p.add_argument("--train_log_every", type=int, default=500)
     p.add_argument("--diagnostic_batch_size", type=int, default=20000)
-    return _apply_target_preset(p.parse_args())
+    return apply_target_preset(p.parse_args())
 
 
-def sample_gmm(key, weights, means, stds, batch_size: int):
+def sample_gmm(key, weights, means, covs, batch_size: int):
     key_comp, key_noise = jax.random.split(key)
     comp = jax.random.categorical(key_comp, jnp.log(weights), shape=(batch_size,))
-    noise = jax.random.normal(key_noise, (batch_size, 1))
-    x0 = means[comp, None] + stds[comp, None] * noise
-    return x0
+    noise = jax.random.normal(key_noise, (batch_size, 2))
+    chol = jnp.linalg.cholesky(covs)
+    return means[comp] + jnp.einsum("bij,bj->bi", chol[comp], noise)
 
 
-def make_actor(cfg: LearnedToyConfig) -> ActorCritic:
+def make_actor(cfg: LearnedToy2DConfig) -> ActorCritic:
     hidden_sizes = [cfg.hidden_dim] * cfg.hidden_num
     diffusion_hidden_sizes = [cfg.diffusion_hidden_dim] * cfg.hidden_num
     return ActorCritic.create(
         obs_dim=1,
-        act_dim=1,
+        act_dim=2,
         hidden_sizes=hidden_sizes,
         diffusion_hidden_sizes=diffusion_hidden_sizes,
         activation=_mish,
@@ -262,10 +291,10 @@ def make_actor(cfg: LearnedToyConfig) -> ActorCritic:
     )
 
 
-def train_policy(actor: ActorCritic, cfg: LearnedToyConfig, weights, means, stds):
+def train_policy(actor: ActorCritic, cfg: LearnedToy2DConfig, weights, means, covs):
     weights_j = jnp.asarray(weights, dtype=jnp.float32)
     means_j = jnp.asarray(means, dtype=jnp.float32)
-    stds_j = jnp.asarray(stds, dtype=jnp.float32)
+    covs_j = jnp.asarray(covs, dtype=jnp.float32)
     opt = optax.adam(cfg.train_lr)
 
     init_key, loop_key = jax.random.split(jax.random.key(cfg.seed + 17))
@@ -274,7 +303,7 @@ def train_policy(actor: ActorCritic, cfg: LearnedToyConfig, weights, means, stds
 
     def loss_fn(params, key):
         key_x0, key_t, key_noise = jax.random.split(key, 3)
-        x0 = sample_gmm(key_x0, weights_j, means_j, stds_j, cfg.train_batch_size)
+        x0 = sample_gmm(key_x0, weights_j, means_j, covs_j, cfg.train_batch_size)
         t = jax.random.randint(key_t, (cfg.train_batch_size,), 0, cfg.diffusion_steps)
         noise = jax.random.normal(key_noise, x0.shape)
         x_t = actor.q_sample(t, x0, noise)
@@ -301,15 +330,15 @@ def train_policy(actor: ActorCritic, cfg: LearnedToyConfig, weights, means, stds
     return policy_params, np.asarray(steps, dtype=np.int32), np.asarray(losses, dtype=np.float64)
 
 
-def eps_mse_by_t(actor: ActorCritic, policy_params, cfg: LearnedToyConfig, weights, means, stds):
+def eps_mse_by_t(actor: ActorCritic, policy_params, cfg: LearnedToy2DConfig, weights, means, covs):
     weights_j = jnp.asarray(weights, dtype=jnp.float32)
     means_j = jnp.asarray(means, dtype=jnp.float32)
-    stds_j = jnp.asarray(stds, dtype=jnp.float32)
+    covs_j = jnp.asarray(covs, dtype=jnp.float32)
 
     @jax.jit
     def mse_one_t(key, t_idx):
         key_x0, key_noise = jax.random.split(key)
-        x0 = sample_gmm(key_x0, weights_j, means_j, stds_j, cfg.diagnostic_batch_size)
+        x0 = sample_gmm(key_x0, weights_j, means_j, covs_j, cfg.diagnostic_batch_size)
         noise = jax.random.normal(key_noise, x0.shape)
         t = jnp.full((cfg.diagnostic_batch_size,), t_idx, dtype=jnp.int32)
         x_t = actor.q_sample(t, x0, noise)
@@ -331,35 +360,14 @@ def eps_mse_by_t(actor: ActorCritic, policy_params, cfg: LearnedToyConfig, weigh
     return np.asarray(eps_mse), np.asarray(x0_mse)
 
 
-def learned_x0_hat_np(model: LearnedToyModel, points, t_idx: int):
-    x = jnp.asarray(np.asarray(points, dtype=np.float32)[:, None])
+def learned_x0_hat_np(model: LearnedToy2DModel, points, t_idx: int):
+    x = jnp.asarray(np.asarray(points, dtype=np.float32))
     eps = model.eps_pred(None, None, x, t_idx)
     x0 = (
         x * model.schedule.sqrt_recip_alphas_cumprod[t_idx]
         - eps * model.schedule.sqrt_recipm1_alphas_cumprod[t_idx]
     )
-    return np.asarray(x0[:, 0])
-
-
-def write_metrics(path: Path, rows: list[dict]) -> None:
-    fieldnames = [
-        "stage",
-        "timestep",
-        "kl_sample_target",
-        "js",
-        "w1",
-        "ks",
-        "sample_mean_q",
-        "target_mean_q",
-        "sample_mean",
-        "sample_std",
-        "acceptance_rate",
-    ]
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({k: row.get(k, "") for k in fieldnames})
+    return np.asarray(x0)
 
 
 def save_training_diagnostics(out: Path, train_steps, train_losses, eps_mse, x0_mse) -> None:
@@ -396,33 +404,61 @@ def save_training_diagnostics(out: Path, train_steps, train_losses, eps_mse, x0_
     plt.close(fig)
 
 
+def write_metrics(path: Path, rows: list[dict]) -> None:
+    fieldnames = [
+        "stage",
+        "timestep",
+        "kl_sample_target",
+        "js",
+        "sliced_w1",
+        "marginal_ks_x",
+        "marginal_ks_y",
+        "sample_mean_q",
+        "target_mean_q",
+        "sample_mean_x",
+        "sample_mean_y",
+        "sample_std_x",
+        "sample_std_y",
+        "acceptance_rate",
+    ]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
 def main() -> None:
     args = parse_args()
-    weights = _normalize_weights(_parse_float_list(args.gmm_weights))
-    means = np.asarray(_parse_float_list(args.gmm_means), dtype=np.float64)
-    stds = np.asarray(_parse_float_list(args.gmm_stds), dtype=np.float64)
-    reward_bump_centers = _parse_float_list(args.reward_bump_centers)
-    reward_bump_widths = _parse_float_list(args.reward_bump_widths)
-    reward_bump_weights = _parse_float_list(args.reward_bump_weights)
-    if not (len(weights) == len(means) == len(stds)):
-        raise ValueError("GMM weights, means, and stds must have the same length.")
-    if np.any(stds <= 0):
-        raise ValueError("GMM stds must be positive.")
+    weights = normalize_weights(parse_float_list(args.gmm_weights))
+    means = np.asarray(parse_matrix_rows(args.gmm_means), dtype=np.float64)
+    stds = np.asarray(parse_matrix_rows(args.gmm_stds), dtype=np.float64)
+    corrs = np.asarray(parse_float_list(args.gmm_corrs), dtype=np.float64)
+    if not (len(weights) == len(means) == len(stds) == len(corrs)):
+        raise ValueError("GMM weights, means, stds, and corrs must have the same length.")
+    covs = make_covariances(stds, corrs)
+    reward_center = parse_vector(args.reward_center)
+    reward_scales = parse_vector(args.reward_scales)
+    reward_bump_centers = parse_matrix_rows(args.reward_bump_centers)
+    reward_bump_widths = parse_matrix_rows(args.reward_bump_widths)
+    reward_bump_weights = parse_float_list(args.reward_bump_weights)
+    reward_sin_freqs = parse_vector(args.reward_sin_freqs)
 
-    cfg = LearnedToyConfig(
+    cfg = LearnedToy2DConfig(
         score_source="learned",
         target_preset=args.target_preset,
         gmm_weights=weights.tolist(),
         gmm_means=means.tolist(),
         gmm_stds=stds.tolist(),
+        gmm_corrs=corrs.tolist(),
         reward_type=args.reward_type,
-        reward_center=args.reward_center,
-        reward_scale=args.reward_scale,
+        reward_center=reward_center,
+        reward_scales=reward_scales,
         reward_bump_centers=reward_bump_centers,
         reward_bump_widths=reward_bump_widths,
         reward_bump_weights=reward_bump_weights,
         reward_sin_amp=args.reward_sin_amp,
-        reward_sin_freq=args.reward_sin_freq,
+        reward_sin_freqs=reward_sin_freqs,
         reward_sin_phase=args.reward_sin_phase,
         reward_l2=args.reward_l2,
         reward_l4=args.reward_l4,
@@ -458,6 +494,8 @@ def main() -> None:
         grid_min=args.grid_min,
         grid_max=args.grid_max,
         grid_points=args.grid_points,
+        metric_target_samples=args.metric_target_samples,
+        metric_slices=args.metric_slices,
         eval_timesteps=args.eval_timesteps,
         output_dir=args.output_dir,
         hidden_num=args.hidden_num,
@@ -471,9 +509,16 @@ def main() -> None:
         train_log_every=args.train_log_every,
         diagnostic_batch_size=args.diagnostic_batch_size,
     )
-    _validate_reward_params(cfg)
-    _validate_sampler_params(cfg)
+    validate_reward_params(cfg)
+    validate_sampler_params(cfg)
 
+    clip_cover = float(np.max(np.abs(means) + 4.0 * stds))
+    if np.isfinite(cfg.x0_hat_clip_radius) and clip_cover > cfg.x0_hat_clip_radius:
+        warnings.warn(
+            f"x0_hat_clip_radius={cfg.x0_hat_clip_radius:g} may clip GMM mass; "
+            f"max |mean|+4*std is {clip_cover:g}.",
+            RuntimeWarning,
+        )
     if cfg.policy_parameterization == "E" and cfg.policy_final_layer in {"L2", "IP"}:
         warnings.warn(
             "L2/IP final layers constrain the scalar energy form; use ff/default for the closest generic baseline.",
@@ -495,102 +540,143 @@ def main() -> None:
     (out / "plots").mkdir(exist_ok=True)
     (out / "config.json").write_text(json.dumps(asdict(cfg), indent=2, sort_keys=True))
 
-    policy_params, train_steps, train_losses = train_policy(actor, cfg, weights, means, stds)
-    eps_mse, x0_mse = eps_mse_by_t(actor, policy_params, cfg, weights, means, stds)
+    policy_params, train_steps, train_losses = train_policy(actor, cfg, weights, means, covs)
+    eps_mse, x0_mse = eps_mse_by_t(actor, policy_params, cfg, weights, means, covs)
     save_training_diagnostics(out, train_steps, train_losses, eps_mse, x0_mse)
 
-    model = LearnedToyModel(
+    model = LearnedToy2DModel(
         actor=actor,
         policy_params=policy_params,
-        reward_center=cfg.reward_center,
-        reward_scale=cfg.reward_scale,
+        reward_type=cfg.reward_type,
+        reward_center=jnp.asarray(reward_center, dtype=jnp.float32),
+        reward_scales=jnp.asarray(reward_scales, dtype=jnp.float32),
+        reward_bump_centers=jnp.asarray(reward_bump_centers, dtype=jnp.float32),
+        reward_bump_widths=jnp.asarray(reward_bump_widths, dtype=jnp.float32),
+        reward_bump_weights=jnp.asarray(reward_bump_weights, dtype=jnp.float32),
+        reward_sin_amp=float(cfg.reward_sin_amp),
+        reward_sin_freqs=jnp.asarray(reward_sin_freqs, dtype=jnp.float32),
+        reward_sin_phase=float(cfg.reward_sin_phase),
+        reward_l2=float(cfg.reward_l2),
+        reward_l4=float(cfg.reward_l4),
         schedule=actor.schedule,
         num_timesteps=cfg.diffusion_steps,
         mala_steps=cfg.mala_steps,
-        x_recon_clip_radius=cfg.x_recon_clip_radius,
+        x_recon_clip_radius=float(cfg.x_recon_clip_radius),
     )
 
     result = run_toy_mala_sampler(jax.random.key(cfg.seed + 404), model, cfg)
-    action_clipped = np.asarray(result.action[:, 0])
-    trace = np.asarray(result.trace[:, :, 0])
-    raw_x0 = np.asarray(result.raw_x0[:, 0])
+    raw_x0 = np.asarray(result.raw_x0)
+    action_clipped = np.asarray(result.action)
+    trace = np.asarray(result.trace)
+    eval_ts = eval_timesteps(cfg.eval_timesteps, cfg.diffusion_steps)
+    rng = np.random.default_rng(cfg.seed + 2029)
     schedule = actor.schedule
-    eval_ts = _eval_timesteps(cfg.eval_timesteps, cfg.diffusion_steps)
 
     rows = []
     panels = []
-    grid = make_eval_grid(raw_x0, cfg, weights, means, stds, schedule, None)
-    final_target = target_density(grid, cfg, weights, means, stds, schedule, None)
-    final_metrics = metrics_from_samples(raw_x0, grid, final_target, cfg)
-    final_metrics.update({
-        "stage": "final_clean",
-        "timestep": -1,
-        "acceptance_rate": float(np.asarray(result.per_level_acc)[0]),
-    })
-    rows.append(final_metrics)
-    panels.append({
-        "label": "final clean",
-        "samples": raw_x0,
-        "grid": grid,
-        "target_dens": final_target,
-        "w1": final_metrics["w1"],
-        "ks": final_metrics["ks"],
-        "js": final_metrics["js"],
-        "acc": final_metrics["acceptance_rate"],
-    })
-    save_density_plot(out / "plots" / "final_clean_density.png", raw_x0, grid, final_target,
-                      "learned final raw x0 vs clean oracle target")
+    grid_x, grid_y = make_eval_grid(raw_x0, cfg, means, covs, schedule, None)
+    final_target = target_density_grid(grid_x, grid_y, cfg, weights, means, covs, schedule, None)
+    xx, yy = np.meshgrid(grid_x, grid_y, indexing="xy")
+    clean_points = np.column_stack([xx.ravel(), yy.ravel()])
+    clean_orig = np.exp(np_base_logpdf(clean_points, weights, means, covs, schedule, None)).reshape(
+        len(grid_y), len(grid_x)
+    )
+    clean_q = np_reward(clean_points, cfg).reshape(len(grid_y), len(grid_x))
+    save_orig_target_comparison(
+        out / "plots" / "orig_vs_target_contours.png",
+        grid_x,
+        grid_y,
+        clean_orig,
+        final_target,
+        clean_q,
+        f"{cfg.target_preset}: clean pi_orig vs pi_target",
+    )
+    save_surface_plot(out / "plots" / "clean_pi_orig_surface.png", grid_x, grid_y, clean_orig, "clean pi_orig")
+    save_surface_plot(out / "plots" / "clean_pi_target_surface.png", grid_x, grid_y, final_target, "clean pi_target")
 
-    clipped_metrics = metrics_from_samples(action_clipped, grid, final_target, cfg)
-    clipped_metrics.update({
-        "stage": "final_clipped_action",
-        "timestep": -1,
-        "acceptance_rate": float("nan"),
-    })
+    final_metrics = metrics_from_samples(raw_x0, grid_x, grid_y, final_target, cfg, rng)
+    final_metrics.update({"stage": "final_clean", "timestep": -1, "acceptance_rate": float(np.asarray(result.per_level_acc)[0])})
+    rows.append(final_metrics)
+    panels.append(
+        {
+            "label": "final clean",
+            "samples": raw_x0,
+            "grid_x": grid_x,
+            "grid_y": grid_y,
+            "target_dens": final_target,
+            "js": final_metrics["js"],
+            "sliced_w1": final_metrics["sliced_w1"],
+            "acc": final_metrics["acceptance_rate"],
+        }
+    )
+    save_contour_plot(out / "plots" / "final_clean_contour.png", raw_x0, grid_x, grid_y, final_target,
+                      "learned final raw x0 vs clean target")
+
+    clipped_metrics = metrics_from_samples(action_clipped, grid_x, grid_y, final_target, cfg, rng)
+    clipped_metrics.update({"stage": "final_clipped_action", "timestep": -1, "acceptance_rate": float("nan")})
     rows.append(clipped_metrics)
 
     for t in eval_ts:
-        grid = make_eval_grid(trace[t], cfg, weights, means, stds, schedule, t)
-        dens = target_density(grid, cfg, weights, means, stds, schedule, t)
-        sample_x0_hat = learned_x0_hat_np(model, trace[t], t)
-        grid_x0_hat = np_x0_hat(grid, weights, means, stds, schedule, t, "tweedie")
+        samples_t = trace[t]
+        grid_x, grid_y = make_eval_grid(samples_t, cfg, means, covs, schedule, t)
+        dens = target_density_grid(grid_x, grid_y, cfg, weights, means, covs, schedule, t)
+        sample_x0_hat = learned_x0_hat_np(model, samples_t, t)
         if np.isfinite(cfg.x0_hat_clip_radius):
             sample_x0_hat = np.clip(sample_x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
-            grid_x0_hat = np.clip(grid_x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
+
+        def target_x0_hat(points, t_idx=t):
+            x0_hat = np_x0_hat(points, weights, means, covs, schedule, t_idx, "tweedie")
+            if np.isfinite(cfg.x0_hat_clip_radius):
+                x0_hat = np.clip(x0_hat, -cfg.x0_hat_clip_radius, cfg.x0_hat_clip_radius)
+            return x0_hat
+
         metrics = metrics_from_samples(
-            trace[t],
-            grid,
+            samples_t,
+            grid_x,
+            grid_y,
             dens,
             cfg,
+            rng,
             q_sample_arg=sample_x0_hat,
-            q_grid_arg=grid_x0_hat,
+            q_target_transform=target_x0_hat,
         )
-        metrics.update({
-            "stage": "intermediate",
-            "timestep": int(t),
-            "acceptance_rate": float(np.asarray(result.per_level_acc)[t]),
-        })
+        metrics.update({"stage": "intermediate", "timestep": int(t), "acceptance_rate": float(np.asarray(result.per_level_acc)[t])})
         rows.append(metrics)
-        panels.append({
-            "label": f"intermediate t={t}",
-            "samples": trace[t],
-            "grid": grid,
-            "target_dens": dens,
-            "w1": metrics["w1"],
-            "ks": metrics["ks"],
-            "js": metrics["js"],
-            "acc": metrics["acceptance_rate"],
-        })
-        save_density_plot(out / "plots" / f"intermediate_t{t:03d}_density.png", trace[t], grid, dens,
-                          f"learned post-MALA x_t at t={t} vs oracle target")
+        panels.append(
+            {
+                "label": f"intermediate t={t}",
+                "samples": samples_t,
+                "grid_x": grid_x,
+                "grid_y": grid_y,
+                "target_dens": dens,
+                "js": metrics["js"],
+                "sliced_w1": metrics["sliced_w1"],
+                "acc": metrics["acceptance_rate"],
+            }
+        )
+        save_contour_plot(
+            out / "plots" / f"intermediate_t{t:03d}_contour.png",
+            samples_t,
+            grid_x,
+            grid_y,
+            dens,
+            f"learned post-MALA x_t at t={t} vs oracle target",
+        )
+        save_surface_plot(
+            out / "plots" / f"intermediate_t{t:03d}_target_surface.png",
+            grid_x,
+            grid_y,
+            dens,
+            f"target density at t={t}",
+        )
 
-    save_density_panel(
-        out / "plots" / "density_panel.png",
+    save_contour_panel(
+        out / "plots" / "contour_panel.png",
         panels,
         (
-            f"learned diffusion: sampler={cfg.sampler}, mala_steps={cfg.mala_steps}, "
-            f"langevin_steps={cfg.langevin_steps}, gradient={cfg.guidance_gradient_space}, "
-            f"predictor={cfg.denoising_predictor}, beta={cfg.beta}"
+            f"learned diffusion: sampler={cfg.sampler}, mala_schedule={cfg.mala_step_schedule}, "
+            f"budget={cfg.mala_budget}, mala_steps={cfg.mala_steps}, gradient={cfg.guidance_gradient_space}, "
+            f"predictor={cfg.denoising_predictor}, denoise_schedule={cfg.denoising_schedule}, beta={cfg.beta}"
         ),
     )
 
@@ -616,7 +702,7 @@ def main() -> None:
     for row in rows:
         print(
             f"{row['stage']:>20s} t={row['timestep']:>3} "
-            f"W1={row['w1']:.5f} KS={row['ks']:.5f} JS={row['js']:.5f} "
+            f"SW1={row['sliced_w1']:.5f} JS={row['js']:.5f} "
             f"acc={row['acceptance_rate']:.3f}"
         )
 

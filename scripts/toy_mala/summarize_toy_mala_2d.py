@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -28,6 +29,8 @@ def parse_args():
     p.add_argument("--runs-file", type=Path, default=None)
     p.add_argument("--match", default="toy_mala_2d_*")
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--metrics-file", type=Path, default=None,
+                   help="Replot heatmaps from an existing sweep_metrics.csv without reading run directories.")
     p.add_argument("--expected-runs", type=int, default=None)
     p.add_argument(
         "--heatmap-metrics",
@@ -153,21 +156,58 @@ def row_guidance_schedule(row: dict) -> str:
     return row.get("guidance_schedule") or "constant"
 
 
-def panel_title(beta, sampler, eta, gradient, guidance_schedule="constant") -> str:
+def row_score_source(row: dict) -> str:
+    return row.get("score_source") or "oracle"
+
+
+def safe_path_component(value) -> str:
+    text = str(value if value not in (None, "") else "unknown")
+    text = re.sub(r"[^A-Za-z0-9_.=-]+", "_", text)
+    return text.strip("_") or "unknown"
+
+
+def heatmap_group_label(row: dict) -> str:
+    return safe_path_component(
+        "_".join([
+            row_score_source(row),
+            row.get("sampler", "mala") or "mala",
+            row_guidance_schedule(row),
+        ])
+    )
+
+
+def panel_group_label_from_cfg(cfg: dict) -> str:
+    denoise = cfg.get("denoising_schedule", "from_predictor")
+    if denoise == "from_predictor":
+        denoise = cfg.get("denoising_predictor", "unknown")
+    return safe_path_component(
+        "_".join([
+            cfg.get("score_source", "oracle"),
+            cfg.get("sampler", "mala"),
+            cfg.get("guidance_schedule", "constant"),
+            cfg.get("guidance_gradient_space", "unknown"),
+            denoise,
+        ])
+    )
+
+
+def panel_title(beta, sampler, eta, gradient, guidance_schedule="constant", score_source="oracle") -> str:
     eta_text = f"eta={eta:g}" if eta is not None and np.isfinite(eta) else "eta=?"
+    score_text = f"{score_source} score"
     if sampler == "mala":
         name = "MALA" if guidance_schedule == "constant" else f"MALA + {guidance_schedule}"
-        return f"{name} | {gradient}\n{eta_text}, beta={beta:g}"
-    return f"Langevin | {gradient}\n{eta_text}, beta={beta:g}"
+        return f"{name} | {score_text} | {gradient}\n{eta_text}, beta={beta:g}"
+    return f"Langevin | {score_text} | {gradient}\n{eta_text}, beta={beta:g}"
 
 
 def algorithm_panel_order(row_key):
-    beta, sampler, eta, gradient, guidance_schedule = row_key
+    beta, sampler, eta, gradient, guidance_schedule, score_source = row_key
+    score_rank = {"oracle": 0, "learned": 1}.get(score_source, 9)
     sampler_rank = 0 if sampler == "mala" else 1
     schedule_rank = {"constant": 0, "alpha_bar": 1}.get(guidance_schedule, 9)
     eta_rank = -1.0 if eta is None or not np.isfinite(eta) else eta
     grad_rank = 0 if gradient == "xt" else 1
-    return (sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
+    return (score_rank, sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
 
 
 def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
@@ -210,6 +250,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         ),
     )
     gradients = [g for g in ["xt", "x0hat"] if any(row["guidance_gradient_space"] == g for row in selected)]
+    score_sources = sorted_unique([row_score_source(row) for row in selected])
     corrector_steps = sorted_unique([
         int(float(row["langevin_steps"] if (row.get("sampler", "mala") or "mala") == "langevin" else row["mala_steps"]))
         for row in selected
@@ -220,10 +261,11 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
 
     panel_keys = sorted(
         [
-            (beta, sampler, eta, gradient, guidance_schedule)
+            (beta, sampler, eta, gradient, guidance_schedule, score_source)
             for beta in betas
             for sampler, eta, guidance_schedule in algo_keys
             for gradient in gradients
+            for score_source in score_sources
         ],
         key=algorithm_panel_order,
     )
@@ -244,7 +286,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
     vmax = float(np.max(finite_values)) if finite_values.size else None
     image = None
 
-    for ax, (beta, sampler, eta, gradient, guidance_schedule) in zip(axes.ravel(), panel_keys):
+    for ax, (beta, sampler, eta, gradient, guidance_schedule, score_source) in zip(axes.ravel(), panel_keys):
         mat = np.full((len(corrector_steps), len(predictors)), np.nan, dtype=np.float64)
         for row in selected:
             row_sampler = row.get("sampler", "mala") or "mala"
@@ -255,6 +297,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
                 or row_eta != eta
                 or row["guidance_gradient_space"] != gradient
                 or row_guidance_schedule(row) != guidance_schedule
+                or row_score_source(row) != score_source
             ):
                 continue
             step_value = row["langevin_steps"] if row_sampler == "langevin" else row["mala_steps"]
@@ -266,7 +309,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         ax.set_yticks(np.arange(len(corrector_steps)), corrector_steps, fontsize=11)
         ax.set_xlabel("denoising predictor", fontsize=12)
         ax.set_ylabel("corrector steps", fontsize=12)
-        ax.set_title(panel_title(beta, sampler, eta, gradient, guidance_schedule), fontsize=13, pad=10)
+        ax.set_title(panel_title(beta, sampler, eta, gradient, guidance_schedule, score_source), fontsize=13, pad=10)
         for y in range(len(corrector_steps)):
             for x in range(len(predictors)):
                 val = mat[y, x]
@@ -308,9 +351,23 @@ def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str]) -> in
     for stage_key in stage_keys:
         stage_dir = heatmap_dir / short_stage_label(stage_key)
         stage_dir.mkdir(exist_ok=True)
+        all_dir = stage_dir / "all"
+        all_dir.mkdir(exist_ok=True)
         for metric in metrics:
-            if save_heatmap_grid(rows, metric, stage_key, stage_dir / f"{metric}.png"):
+            if save_heatmap_grid(rows, metric, stage_key, all_dir / f"{metric}.png"):
                 count += 1
+        group_labels = sorted({
+            heatmap_group_label(row)
+            for row in rows
+            if row_stage_key(row) == stage_key and (row.get("sampler", "mala") or "mala") in {"mala", "langevin"}
+        })
+        for group_label in group_labels:
+            group_rows = [row for row in rows if heatmap_group_label(row) == group_label]
+            group_dir = stage_dir / group_label
+            group_dir.mkdir(exist_ok=True)
+            for metric in metrics:
+                if save_heatmap_grid(group_rows, metric, stage_key, group_dir / f"{metric}.png"):
+                    count += 1
     return count
 
 
@@ -333,7 +390,9 @@ def copy_panels(run_dirs: list[Path], configs: list[dict], out_dir: Path) -> int
             f"beta{cfg.get('beta')}_"
             f"{run_dir.name}.png"
         )
-        shutil.copy2(src, panel_dir / name)
+        group_dir = panel_dir / panel_group_label_from_cfg(cfg)
+        group_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, group_dir / name)
         count += 1
     return count
 
@@ -361,8 +420,10 @@ def write_metadata(
             "run_manifest": str(out_dir / "run_manifest.csv"),
             "sweep_metrics": str(out_dir / "sweep_metrics.csv"),
             "panels": str(out_dir / "panels"),
+            "panel_layout": "panels/<experiment_group>/<run>_contour_panel.png",
             "panel_count": panel_count,
             "heatmaps": str(out_dir / "heatmaps"),
+            "heatmap_layout": "heatmaps/<time_step>/{all,<experiment_group>}/<metric>.png",
             "heatmap_count": heatmap_count,
         },
         "run_dirs": [str(path) for path in run_dirs],
@@ -376,8 +437,8 @@ def write_metadata(
         f"- Runs file: `{metadata['runs_file']}`",
         f"- Sweep metrics: `sweep_metrics.csv`",
         f"- Run manifest: `run_manifest.csv`",
-        f"- Panels: `panels/` ({panel_count} files)",
-        f"- Heatmaps: `heatmaps/` ({heatmap_count} files)",
+        f"- Panels: `panels/<experiment_group>/` ({panel_count} files)",
+        f"- Heatmaps: `heatmaps/<time_step>/{{all,<experiment_group>}}/` ({heatmap_count} files)",
         "",
         "## Swept Parameters",
         "",
@@ -396,6 +457,15 @@ def write_metadata(
 
 def main() -> None:
     args = parse_args()
+    if args.metrics_file is not None:
+        rows = read_csv(args.metrics_file)
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        heatmap_metrics = [m.strip() for m in args.heatmap_metrics.replace(",", " ").split() if m.strip()]
+        heatmap_count = save_all_heatmaps(rows, args.out_dir, heatmap_metrics)
+        print(f"replotted from: {args.metrics_file}")
+        print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
+        return
+
     run_dirs = discover_run_dirs(args)
     if args.expected_runs is not None and len(run_dirs) != args.expected_runs:
         raise SystemExit(f"Expected {args.expected_runs} run dirs, found {len(run_dirs)}.")
@@ -430,6 +500,9 @@ def main() -> None:
                 "denoising_predictor": cfg.get("denoising_predictor"),
                 "denoising_schedule": cfg.get("denoising_schedule", "from_predictor"),
                 "x0_hat_method": cfg.get("x0_hat_method"),
+                "x0_hat_clip_radius": cfg.get("x0_hat_clip_radius", 1_000_000.0),
+                "x_recon_clip_radius": cfg.get("x_recon_clip_radius", 1_000_000.0),
+                "action_clip_radius": cfg.get("action_clip_radius", 1_000_000.0),
                 "beta": cfg.get("beta"),
                 "beta_schedule_type": cfg.get("beta_schedule_type"),
                 "mala_adapt_rate": cfg.get("mala_adapt_rate"),

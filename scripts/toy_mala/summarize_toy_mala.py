@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,7 @@ import numpy as np
 KEY_COLUMNS = [
     "run_name",
     "run_dir",
+    "score_source",
     "target_preset",
     "reward_type",
     "sampler",
@@ -52,6 +54,7 @@ KEY_COLUMNS = [
     "diffusion_steps",
     "x0_hat_clip_radius",
     "x_recon_clip_radius",
+    "action_clip_radius",
     "mala_adapt_rate",
     "train_steps",
     "policy_parameterization",
@@ -169,7 +172,9 @@ def write_experiment_metadata(
             "run_manifest": str(manifest_path),
             "sweep_metrics": str(summary_path),
             "panels": str(panel_dir),
+            "panel_layout": "panels/<experiment_group>/<run>_density_panel.png",
             "heatmaps": str(heatmap_dir),
+            "heatmap_layout": "heatmaps/<time_step>/{all,<experiment_group>}/<metric>.png",
             "heatmap_count": heatmap_count,
             "quality_curves": str(curve_dir),
             "quality_curve_count": curve_count,
@@ -188,8 +193,8 @@ def write_experiment_metadata(
         f"- Runs file: `{metadata['runs_file']}`",
         f"- Sweep metrics: `{summary_path.name}`",
         f"- Run manifest: `{manifest_path.name}`",
-        f"- Panels: `{panel_dir.name}/`",
-        f"- Heatmaps: `{heatmap_dir.name}/` ({heatmap_count} files)",
+        f"- Panels: `{panel_dir.name}/<experiment_group>/`",
+        f"- Heatmaps: `{heatmap_dir.name}/<time_step>/{{all,<experiment_group>}}/` ({heatmap_count} files)",
         f"- Quality curves: `{curve_dir.name}/` ({curve_count} files)",
         "",
         "## Swept Parameters",
@@ -554,21 +559,59 @@ def row_guidance_schedule(row: dict) -> str:
     return row.get("guidance_schedule") or "constant"
 
 
-def panel_title(beta, sampler, eta, gradient, guidance_schedule="constant") -> str:
+def row_score_source(row: dict) -> str:
+    return row.get("score_source") or "oracle"
+
+
+def safe_path_component(value) -> str:
+    text = str(value if value not in (None, "") else "unknown")
+    text = re.sub(r"[^A-Za-z0-9_.=-]+", "_", text)
+    return text.strip("_") or "unknown"
+
+
+def heatmap_group_label(row: dict) -> str:
+    return safe_path_component(
+        "_".join([
+            row_score_source(row),
+            row.get("sampler", "mala") or "mala",
+            row_guidance_schedule(row),
+        ])
+    )
+
+
+def panel_group_label_from_cfg(cfg) -> str:
+    sampler = get_cfg_attr(cfg, "sampler", "mala")
+    denoise = get_cfg_attr(cfg, "denoising_schedule", "from_predictor")
+    if denoise == "from_predictor":
+        denoise = get_cfg_attr(cfg, "denoising_predictor", "unknown")
+    return safe_path_component(
+        "_".join([
+            get_cfg_attr(cfg, "score_source", "oracle"),
+            sampler,
+            get_cfg_attr(cfg, "guidance_schedule", "constant"),
+            get_cfg_attr(cfg, "guidance_gradient_space", "unknown"),
+            denoise,
+        ])
+    )
+
+
+def panel_title(beta, sampler, eta, gradient, guidance_schedule="constant", score_source="oracle") -> str:
     eta_text = f"eta={eta:g}" if eta is not None and np.isfinite(eta) else "eta=?"
+    score_text = f"{score_source} score"
     if sampler == "mala":
         name = "MALA" if guidance_schedule == "constant" else f"MALA + {guidance_schedule}"
-        return f"{name} | {gradient}\n{eta_text}, beta={beta:g}"
-    return f"Langevin | {gradient}\n{eta_text}, beta={beta:g}"
+        return f"{name} | {score_text} | {gradient}\n{eta_text}, beta={beta:g}"
+    return f"Langevin | {score_text} | {gradient}\n{eta_text}, beta={beta:g}"
 
 
 def algorithm_panel_order(row_key):
-    beta, sampler, eta, gradient, guidance_schedule = row_key
+    beta, sampler, eta, gradient, guidance_schedule, score_source = row_key
+    score_rank = {"oracle": 0, "learned": 1}.get(score_source, 9)
     sampler_rank = 0 if sampler == "mala" else 1
     schedule_rank = {"constant": 0, "alpha_bar": 1}.get(guidance_schedule, 9)
     eta_rank = -1.0 if eta is None or not np.isfinite(eta) else eta
     grad_rank = 0 if gradient == "xt" else 1
-    return (sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
+    return (score_rank, sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
 
 
 def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
@@ -609,6 +652,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         ),
     )
     gradients = [g for g in ["xt", "x0hat"] if any(row["guidance_gradient_space"] == g for row in selected)]
+    score_sources = sorted_unique([row_score_source(row) for row in selected])
     corrector_steps = sorted_unique([
         int(float(row["langevin_steps"] if (row.get("sampler", "mala") or "mala") == "langevin" else row["mala_steps"]))
         for row in selected
@@ -619,10 +663,11 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
 
     panel_keys = sorted(
         [
-            (beta, sampler, eta, gradient, guidance_schedule)
+            (beta, sampler, eta, gradient, guidance_schedule, score_source)
             for beta in betas
             for sampler, eta, guidance_schedule in algo_keys
             for gradient in gradients
+            for score_source in score_sources
         ],
         key=algorithm_panel_order,
     )
@@ -642,7 +687,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
     vmin = float(np.min(finite_values)) if finite_values.size else None
     vmax = float(np.max(finite_values)) if finite_values.size else None
     image = None
-    for ax, (beta, sampler, eta, gradient, guidance_schedule) in zip(axes.ravel(), panel_keys):
+    for ax, (beta, sampler, eta, gradient, guidance_schedule, score_source) in zip(axes.ravel(), panel_keys):
         mat = np.full((len(corrector_steps), len(predictors)), np.nan, dtype=np.float64)
         for row in selected:
             row_sampler = row.get("sampler", "mala") or "mala"
@@ -654,6 +699,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
                 or not eta_matches
                 or row["guidance_gradient_space"] != gradient
                 or row_guidance_schedule(row) != guidance_schedule
+                or row_score_source(row) != score_source
             ):
                 continue
             step_value = row["langevin_steps"] if row_sampler == "langevin" else row["mala_steps"]
@@ -665,7 +711,7 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         ax.set_yticks(np.arange(len(corrector_steps)), corrector_steps, fontsize=11)
         ax.set_xlabel("denoising predictor", fontsize=12)
         ax.set_ylabel("corrector steps", fontsize=12)
-        ax.set_title(panel_title(beta, sampler, eta, gradient, guidance_schedule), fontsize=13, pad=10)
+        ax.set_title(panel_title(beta, sampler, eta, gradient, guidance_schedule, score_source), fontsize=13, pad=10)
         for y in range(len(corrector_steps)):
             for x in range(len(predictors)):
                 val = mat[y, x]
@@ -707,10 +753,24 @@ def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str]) -> in
     for stage_key in stage_keys:
         stage_dir = heatmap_dir / short_stage_label(stage_key)
         stage_dir.mkdir(exist_ok=True)
+        all_dir = stage_dir / "all"
+        all_dir.mkdir(exist_ok=True)
         for metric in metrics:
-            path = stage_dir / f"{metric}.png"
+            path = all_dir / f"{metric}.png"
             if save_heatmap_grid(rows, metric, stage_key, path):
                 count += 1
+        group_labels = sorted({
+            heatmap_group_label(row)
+            for row in rows
+            if row_stage_key(row) == stage_key and (row.get("sampler", "mala") or "mala") in {"mala", "langevin"}
+        })
+        for group_label in group_labels:
+            group_rows = [row for row in rows if heatmap_group_label(row) == group_label]
+            group_dir = stage_dir / group_label
+            group_dir.mkdir(exist_ok=True)
+            for metric in metrics:
+                if save_heatmap_grid(group_rows, metric, stage_key, group_dir / f"{metric}.png"):
+                    count += 1
     return count
 
 
@@ -952,14 +1012,10 @@ def main():
         else:
             rows = read_metrics(metrics_path)
 
-        panel_src = run_dir / "plots" / "density_panel.png"
-        if panel_src.exists():
-            panel_dst = panel_dir / f"{run_dir.name}_density_panel.png"
-            panel_dst.write_bytes(panel_src.read_bytes())
-
         prefix = {
             "run_name": run_dir.name,
             "run_dir": str(run_dir),
+            "score_source": get_cfg_attr(cfg, "score_source", "oracle"),
             "target_preset": get_cfg_attr(cfg, "target_preset", "manual"),
             "reward_type": get_cfg_attr(cfg, "reward_type", "quadratic"),
             "sampler": get_cfg_attr(cfg, "sampler", "mala"),
@@ -984,13 +1040,20 @@ def main():
             "num_samples": cfg.num_samples,
             "diffusion_steps": cfg.diffusion_steps,
             "x0_hat_clip_radius": cfg.x0_hat_clip_radius,
-            "x_recon_clip_radius": get_cfg_attr(cfg, "x_recon_clip_radius", 1.0),
+            "x_recon_clip_radius": get_cfg_attr(cfg, "x_recon_clip_radius", 1_000_000.0),
+            "action_clip_radius": get_cfg_attr(cfg, "action_clip_radius", 1_000_000.0),
             "mala_adapt_rate": cfg.mala_adapt_rate,
             "train_steps": get_cfg_attr(cfg, "train_steps", ""),
             "policy_parameterization": get_cfg_attr(cfg, "policy_parameterization", ""),
             "policy_final_layer": get_cfg_attr(cfg, "policy_final_layer", ""),
             "seed": cfg.seed,
         }
+        panel_src = run_dir / "plots" / "density_panel.png"
+        if panel_src.exists():
+            group_dir = panel_dir / panel_group_label_from_cfg(cfg)
+            group_dir.mkdir(parents=True, exist_ok=True)
+            panel_dst = group_dir / f"{run_dir.name}_density_panel.png"
+            panel_dst.write_bytes(panel_src.read_bytes())
         manifest_rows.append(prefix)
         for row in rows:
             all_rows.append({**prefix, **row})

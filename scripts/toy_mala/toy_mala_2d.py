@@ -76,6 +76,7 @@ class Toy2DConfig:
     x0_hat_method: str
     x0_hat_clip_radius: float
     x_recon_clip_radius: float
+    action_clip_radius: float
     mala_adapt_rate: float
     guidance_strength_multiplier: float
     batch_independent_guidance: bool
@@ -304,8 +305,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--guidance_gradient_space", choices=["xt", "x0hat", "x0hatclipped"], default="xt")
     p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="tweedie",
                    help="Oracle posterior mean is stable; tweedie uses the standard epsilon-reconstruction formula.")
-    p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
-    p.add_argument("--x_recon_clip_radius", type=float, default=1.0)
+    p.add_argument("--x0_hat_clip_radius", type=float, default=1_000_000.0,
+                   help="Guidance x0_hat clip radius. Default is intentionally huge so toy experiments do not inherit bounded-action clipping.")
+    p.add_argument("--x_recon_clip_radius", type=float, default=1_000_000.0,
+                   help="DDPM_mean clean reconstruction clip radius. Default is intentionally huge for unbounded toy targets; pass 1.0 explicitly to mimic bounded-action MGMD.")
+    p.add_argument("--action_clip_radius", type=float, default=1_000_000.0,
+                   help="Final action clip radius used only for the final_clipped_action diagnostic stage. Default is intentionally huge for toy experiments.")
     p.add_argument("--mala_adapt_rate", type=float, default=0.2)
     p.add_argument("--guidance_strength_multiplier", type=float, default=1.0)
     p.add_argument("--batch_independent_guidance", action="store_true")
@@ -941,7 +946,7 @@ def run_toy_mala_sampler(key: jax.Array, model: Toy2DModel, cfg: Toy2DConfig) ->
             per_level_clip = per_level_clip.at[t_idx].set(clip_frac)
             x_t = denoising_step(t_idx, mala_x_t)
         raw_x0 = x_t
-        action = jnp.clip(raw_x0, -1.0, 1.0)
+        action = jnp.clip(raw_x0, -cfg.action_clip_radius, cfg.action_clip_radius)
         return Toy2DSamplerResult(action, raw_x0, trace, log_eta_scales, per_level_acc, per_level_clip)
 
     return jax.jit(_run)(key)
@@ -1002,6 +1007,7 @@ def main() -> None:
         x0_hat_method=args.x0_hat_method,
         x0_hat_clip_radius=args.x0_hat_clip_radius,
         x_recon_clip_radius=args.x_recon_clip_radius,
+        action_clip_radius=args.action_clip_radius,
         mala_adapt_rate=args.mala_adapt_rate,
         guidance_strength_multiplier=args.guidance_strength_multiplier,
         batch_independent_guidance=args.batch_independent_guidance,

@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--advantage_normalization", action="store_true")
     p.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0)
     p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="tweedie")
-    p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
+    p.add_argument("--x0_hat_clip_radius", type=float, default=1_000_000.0)
     p.add_argument("--grid_min", type=float, default=-2.6)
     p.add_argument("--grid_max", type=float, default=2.6)
     p.add_argument("--grid_points", type=int, default=181)
@@ -149,7 +149,7 @@ def main() -> None:
         guidance_gradient_space="xt",
         x0_hat_method=args.x0_hat_method,
         x0_hat_clip_radius=args.x0_hat_clip_radius,
-        x_recon_clip_radius=1.0,
+        x_recon_clip_radius=1_000_000.0,
         mala_adapt_rate=0.0,
         guidance_strength_multiplier=1.0,
         batch_independent_guidance=False,

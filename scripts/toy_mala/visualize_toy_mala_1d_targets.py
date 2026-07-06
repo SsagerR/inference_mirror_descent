@@ -96,7 +96,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--advantage_normalization", action="store_true")
     p.add_argument("--initial_advantage_second_moment_ema", type=float, default=1.0)
     p.add_argument("--x0_hat_method", choices=["posterior_mean", "tweedie"], default="tweedie")
-    p.add_argument("--x0_hat_clip_radius", type=float, default=10.0)
+    p.add_argument("--x0_hat_clip_radius", type=float, default=1_000_000.0)
     p.add_argument("--grid_min", type=float, default=-6.0)
     p.add_argument("--grid_max", type=float, default=6.0)
     p.add_argument("--grid_points", type=int, default=2001)
