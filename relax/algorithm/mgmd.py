@@ -81,6 +81,8 @@ class MGMD:
             batch_independent_guidance=self.cfg.batch_independent_guidance,
             advantage_normalization=self.cfg.advantage_normalization,
             denoising_predictor=self.cfg.denoising_predictor,
+            denoising_suffix_steps=self.cfg.denoising_suffix_steps,
+            denoising_suffix_predictor=self.cfg.denoising_suffix_predictor,
             guidance_gradient_space=self.cfg.guidance_gradient_space,
         )
         sampler = build_mala_sampler(**_sampler_kw)

@@ -109,6 +109,8 @@ class MGMDConfig:
     x0_hat_clip_radius: float = 1.0
     mala_adapt_rate: float = 0.05
     denoising_predictor: str = "DDPM_mean"
+    denoising_suffix_steps: int = 0
+    denoising_suffix_predictor: str = "Identity"
     q_td_huber_width: float = float("inf")
     batch_independent_guidance: bool = False
     guidance_strength_multiplier: float = 1.0
@@ -149,6 +151,8 @@ class MGMDConfig:
             x0_hat_clip_radius=args.x0_hat_clip_radius,
             mala_adapt_rate=args.mala_adapt_rate,
             denoising_predictor=args.denoising_predictor,
+            denoising_suffix_steps=args.denoising_suffix_steps,
+            denoising_suffix_predictor=args.denoising_suffix_predictor,
             q_td_huber_width=args.q_td_huber_width,
             batch_independent_guidance=args.batch_independent_guidance,
             guidance_strength_multiplier=args.guidance_strength_multiplier,

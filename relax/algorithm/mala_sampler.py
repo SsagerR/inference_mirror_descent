@@ -31,6 +31,8 @@ def build_mala_sampler(
     advantage_normalization: bool,
     denoising_predictor: str,
     guidance_gradient_space: str,
+    denoising_suffix_steps: int = 0,
+    denoising_suffix_predictor: str = "Identity",
 ) -> Callable:
     """Return ``stateless_get_action_mala_full(key, state, obs, aggregate_q_fn)``.
 
@@ -164,15 +166,32 @@ def build_mala_sampler(
                 + (sqrt_one_minus_ab_prev - (sqrt_ab_prev / sqrt_ab_t) * sqrt_one_minus_ab_t) * eps_pred
             )
 
-        if denoising_predictor == "Identity":
-            def denoising_step(t_idx, x_curr):
-                return x_curr
-        elif denoising_predictor == "DDPM_mean":
-            denoising_step = ddpm_mean_step
-        elif denoising_predictor == "DDIM":
-            denoising_step = ddim_step
+        def step_for_predictor(name: str):
+            if name == "Identity":
+                def identity_step(t_idx, x_curr):
+                    del t_idx
+                    return x_curr
+                return identity_step
+            if name == "DDPM_mean":
+                return ddpm_mean_step
+            if name == "DDIM":
+                return ddim_step
+            raise ValueError(f"Unknown denoising predictor: {name}")
+
+        base_denoising_step = step_for_predictor(denoising_predictor)
+        suffix_denoising_step = step_for_predictor(denoising_suffix_predictor)
+        denoising_suffix_steps_i = int(denoising_suffix_steps)
+        if denoising_suffix_steps_i <= 0 or denoising_suffix_predictor == denoising_predictor:
+            denoising_step = base_denoising_step
         else:
-            raise ValueError(f"Unknown denoising_predictor: {denoising_predictor}")
+            def denoising_step(t_idx, x_curr):
+                use_suffix = t_idx < denoising_suffix_steps_i
+                return jax.lax.cond(
+                    use_suffix,
+                    lambda _: suffix_denoising_step(t_idx, x_curr),
+                    lambda _: base_denoising_step(t_idx, x_curr),
+                    operand=None,
+                )
 
         # ---- MALA step-size scale clamp range (shared across all levels) -
         log_eta_min = jnp.log(jnp.float32(1e-8) / jnp.maximum(jnp.max(schedule.betas), jnp.float32(1e-8)))

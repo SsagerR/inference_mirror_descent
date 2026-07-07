@@ -9,6 +9,10 @@ DENOISING_SCHEDULE_SWEEP_CHOICES = (
     "DDPM_then_last2_DDIM",
     "Identity_then_last1_DDIM",
     "Identity_then_last2_DDIM",
+    "DDPM_then_last1_Identity",
+    "DDPM_then_last2_Identity",
+    "DDIM_then_last1_Identity",
+    "DDIM_then_last2_Identity",
 )
 
 DENOISING_SCHEDULE_CHOICES = ("from_predictor",) + DENOISING_SCHEDULE_SWEEP_CHOICES
@@ -31,4 +35,12 @@ def denoising_predictor_for_step(schedule_name: str, legacy_predictor: str, t_id
         return "DDIM" if int(t_idx) < 1 else "Identity"
     if schedule_name == "Identity_then_last2_DDIM":
         return "DDIM" if int(t_idx) < 2 else "Identity"
+    if schedule_name == "DDPM_then_last1_Identity":
+        return "Identity" if int(t_idx) < 1 else "DDPM_mean"
+    if schedule_name == "DDPM_then_last2_Identity":
+        return "Identity" if int(t_idx) < 2 else "DDPM_mean"
+    if schedule_name == "DDIM_then_last1_Identity":
+        return "Identity" if int(t_idx) < 1 else "DDIM"
+    if schedule_name == "DDIM_then_last2_Identity":
+        return "Identity" if int(t_idx) < 2 else "DDIM"
     raise ValueError(f"Unknown denoising_schedule: {schedule_name}")

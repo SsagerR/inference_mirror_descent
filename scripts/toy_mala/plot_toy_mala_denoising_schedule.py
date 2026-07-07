@@ -23,6 +23,10 @@ DENOISING_ORDER = [
     "DDPM_then_last2_DDIM",
     "Identity_then_last1_DDIM",
     "Identity_then_last2_DDIM",
+    "DDPM_then_last1_Identity",
+    "DDPM_then_last2_Identity",
+    "DDIM_then_last1_Identity",
+    "DDIM_then_last2_Identity",
 ]
 MALA_SCHEDULE_ORDER = ["constant", "linear_low_noise", "quadratic_low_noise"]
 

@@ -33,6 +33,22 @@ def parse_args():
                    help="Replot heatmaps from an existing sweep_metrics.csv without reading run directories.")
     p.add_argument("--expected-runs", type=int, default=None)
     p.add_argument(
+        "--skip-heatmaps",
+        action="store_true",
+        help="Write summary CSVs, copied panels, and metadata without generating heatmap PNGs.",
+    )
+    p.add_argument(
+        "--skip-panels",
+        action="store_true",
+        help="Do not copy per-run contour panels into the summary directory.",
+    )
+    p.add_argument(
+        "--heatmap-dpi",
+        type=int,
+        default=240,
+        help="DPI for heatmap PNGs. Lower values are faster and smaller.",
+    )
+    p.add_argument(
         "--heatmap-metrics",
         default=(
             "sliced_w1,js,kl_sample_target,marginal_ks_x,marginal_ks_y,"
@@ -210,7 +226,7 @@ def algorithm_panel_order(row_key):
     return (score_rank, sampler_rank, schedule_rank, eta_rank, grad_rank, beta)
 
 
-def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path) -> bool:
+def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: Path, dpi: int) -> bool:
     reference_rows = [
         row
         for row in rows
@@ -337,12 +353,12 @@ def save_heatmap_grid(rows: list[dict], metric: str, stage_key: str, out_path: P
         hspace=0.62,
         wspace=0.28,
     )
-    fig.savefig(out_path, dpi=240)
+    fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
     return True
 
 
-def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str]) -> int:
+def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str], dpi: int) -> int:
     heatmap_dir = out_dir / "heatmaps"
     heatmap_dir.mkdir(exist_ok=True)
     count = 0
@@ -354,7 +370,7 @@ def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str]) -> in
         all_dir = stage_dir / "all"
         all_dir.mkdir(exist_ok=True)
         for metric in metrics:
-            if save_heatmap_grid(rows, metric, stage_key, all_dir / f"{metric}.png"):
+            if save_heatmap_grid(rows, metric, stage_key, all_dir / f"{metric}.png", dpi):
                 count += 1
         group_labels = sorted({
             heatmap_group_label(row)
@@ -366,7 +382,7 @@ def save_all_heatmaps(rows: list[dict], out_dir: Path, metrics: list[str]) -> in
             group_dir = stage_dir / group_label
             group_dir.mkdir(exist_ok=True)
             for metric in metrics:
-                if save_heatmap_grid(group_rows, metric, stage_key, group_dir / f"{metric}.png"):
+                if save_heatmap_grid(group_rows, metric, stage_key, group_dir / f"{metric}.png", dpi):
                     count += 1
     return count
 
@@ -461,9 +477,12 @@ def main() -> None:
         rows = read_csv(args.metrics_file)
         args.out_dir.mkdir(parents=True, exist_ok=True)
         heatmap_metrics = [m.strip() for m in args.heatmap_metrics.replace(",", " ").split() if m.strip()]
-        heatmap_count = save_all_heatmaps(rows, args.out_dir, heatmap_metrics)
+        heatmap_count = 0 if args.skip_heatmaps else save_all_heatmaps(rows, args.out_dir, heatmap_metrics, args.heatmap_dpi)
         print(f"replotted from: {args.metrics_file}")
-        print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
+        if args.skip_heatmaps:
+            print("heatmap generation skipped")
+        else:
+            print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
         return
 
     run_dirs = discover_run_dirs(args)
@@ -521,15 +540,20 @@ def main() -> None:
     write_csv(args.out_dir / "sweep_metrics.csv", all_rows)
 
     heatmap_metrics = [m.strip() for m in args.heatmap_metrics.replace(",", " ").split() if m.strip()]
-    heatmap_count = save_all_heatmaps(all_rows, args.out_dir, heatmap_metrics)
-    panel_count = copy_panels(run_dirs, configs, args.out_dir)
+    panel_count = 0 if args.skip_panels else copy_panels(run_dirs, configs, args.out_dir)
+    heatmap_count = 0 if args.skip_heatmaps else save_all_heatmaps(
+        all_rows, args.out_dir, heatmap_metrics, args.heatmap_dpi
+    )
     write_metadata(args.out_dir, args, configs, run_dirs, heatmap_metrics, heatmap_count, panel_count)
 
     print(f"runs summarized: {len(run_dirs)}")
     print(f"run manifest: {args.out_dir / 'run_manifest.csv'}")
     print(f"summary table: {args.out_dir / 'sweep_metrics.csv'}")
     print(f"panel images: {args.out_dir / 'panels'} ({panel_count} files)")
-    print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
+    if args.skip_heatmaps:
+        print("heatmap generation skipped")
+    else:
+        print(f"heatmap images: {args.out_dir / 'heatmaps'} ({heatmap_count} files)")
 
 
 if __name__ == "__main__":

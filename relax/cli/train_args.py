@@ -80,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mala_steps", type=int, default=0, help="Number of MALA correction steps per diffusion step.")
     parser.add_argument("--mala_adapt_rate", type=float, default=0.05, help="Robbins-Monro adaptation rate for MALA log_eta_scale updates.")
     parser.add_argument("--denoising_predictor", type=str, default="DDPM_mean", choices=["Identity", "DDPM_mean", "DDIM"], help="Predictor transition after each MALA correction level. Identity skips denoising; DDPM_mean uses the guided DDPM posterior mean; DDIM uses the guided deterministic DDIM update.")
+    parser.add_argument("--denoising_suffix_steps", type=int, default=0, help="Number of final low-noise denoising transitions that should use --denoising_suffix_predictor instead of --denoising_predictor. 0 preserves the base predictor everywhere.")
+    parser.add_argument("--denoising_suffix_predictor", type=str, default="Identity", choices=["Identity", "DDPM_mean", "DDIM"], help="Predictor used for the final --denoising_suffix_steps low-noise transitions.")
 
     return parser
 
@@ -134,3 +136,7 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--delay_update must be > 0.")
     if args.mala_steps <= 0:
         parser.error("--mala_steps must be > 0; the non-MALA sampling branches have been removed.")
+    if args.denoising_suffix_steps < 0:
+        parser.error("--denoising_suffix_steps must be >= 0.")
+    if args.denoising_suffix_steps > args.diffusion_steps:
+        parser.error("--denoising_suffix_steps must be <= --diffusion_steps.")
