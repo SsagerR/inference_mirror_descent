@@ -25,6 +25,7 @@ SBATCH_TEMPLATE = """#!/bin/bash
 #SBATCH --partition={partition}
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+{exclude_directive}
 #SBATCH --cpus-per-task={cpus}
 #SBATCH --mem={mem}
 #SBATCH --gres=gpu:{num_gpus}
@@ -71,6 +72,7 @@ def parse_args():
     p.add_argument("--partition", "-p", default=None)
     p.add_argument("--account", default="kempner_kdbrantley_lab")
     p.add_argument("--requeue", action="store_true")
+    p.add_argument("--exclude", default=None, help="Optional SLURM node exclude list, e.g. holygpu8a19102.")
     p.add_argument("--num-gpus", type=int, default=1)
     p.add_argument("--cpus", "-c", type=int, default=2)
     p.add_argument("--mem", default="16G")
@@ -135,6 +137,15 @@ def build_jobs(base_cmd: str, ablations):
     return jobs
 
 
+def exclude_directive(exclude: str | None) -> str:
+    if not exclude:
+        return ""
+    exclude = exclude.strip()
+    if not exclude:
+        return ""
+    return f"#SBATCH --exclude={exclude}"
+
+
 def main():
     args = parse_args()
     project_dir = Path(__file__).resolve().parents[2]
@@ -168,6 +179,7 @@ def main():
             log_dir=log_dir,
             project_dir=project_dir,
             cmd=cmd_for_script,
+            exclude_directive=exclude_directive(args.exclude),
             requeue_directives=requeue_directives,
         )
         script_path = log_dir / f"{job_name}.sbatch"
