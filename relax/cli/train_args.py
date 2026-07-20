@@ -95,7 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance_gradient_space", type=str, default="xt", choices=["xt", "x0hat", "x0hatclipped"], help="Whether to take the Q gradient with respect to 'xt' or the predicted clean action 'x0hat' or its clipped version 'x0hatclipped'.")
 
     # ----- multi-action denoising + V-free advantage normalization ----------
-    parser.add_argument("--num_denoised_actions", type=int, default=1, help="Number K of actions denoised per state in one sampler pass (formerly 'num_particles'). All K share the state and are iid draws. Rollout uses one (index 0, a uniform draw). The TD backup averages the clipped-double-Q over the K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
+    parser.add_argument("--num_denoised_actions", type=int, default=1, help="Training-time number K of denoised next-actions per sampled replay state. The TD backup averages clipped-double-Q over these K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. This is separate from rollout-time --best_of_n_actions. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
+    parser.add_argument("--best_of_n_actions", type=int, default=1, help="Rollout-time best-of-N candidate count. N=1 preserves the current uniform single-sample rollout exactly. N>1 denoises N candidate actions at the current env state, picks the highest final online --q_agg_sample Q candidate, then adds DPMD-style learned Gaussian execution noise with std exp(log_best_of_n_noise_scale). Separate from training-time --num_denoised_actions.")
+    parser.add_argument("--best_of_n_noise_scale_init", type=float, default=0.5, help="Initial std for learned post-best-of-N rollout Gaussian noise. Default 0.5 matches DPMD's exp(log(5))*noise_scale with noise_scale=0.1.")
+    parser.add_argument("--best_of_n_noise_lr", type=float, default=7e-3, help="Adam learning rate for the DPMD-style best-of-N rollout noise scheduler. Used only when --best_of_n_actions > 1.")
+    parser.add_argument("--delay_best_of_n_noise_update", type=int, default=250, help="Update the best-of-N rollout noise scheduler every this many MGMD update steps. Used only when --best_of_n_actions > 1.")
+    parser.add_argument("--best_of_n_noise_target_entropy_scale", type=float, default=0.9, help="Target entropy coefficient c in H_target = -c * act_dim for the learned best-of-N rollout noise scheduler. Default 0.9 matches DPMD.")
     parser.add_argument("--batch_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization. At each MALA/denoising step, rescale Q by 1/sqrt(mean_s Var_K(Q)): the per-state sample variance (ddof=1) of Q over the K denoised Tweedie estimates, averaged over the batch, square-rooted, and stop-gradient'd. Requires --num_denoised_actions >= 2. Composes additively with --beta / other normalizations.")
     parser.add_argument("--q_loss_normalization", action="store_true", default=False, help="V-free guidance normalization. Divide the guidance Q by sqrt(EMA(Q TD loss)), where the EMA (rate --advantage_ema_tau) is tracked in-graph from the critic loss. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta.")
     parser.add_argument("--ema_advantage_normalization", action="store_true", default=False, help="V-free guidance normalization ported from diffusion_policy_online_rl. Divide the guidance Q by a slow EMA of the batch std of the online --q_agg_sample-aggregated Q at the sampled next-actions: Q_norm = (Q - mu)/sigma with mu, sigma stop-gradient'd (mu cancels in the guidance gradient, so this is effectively a 1/sigma rescale). EMA rate --advantage_norm_ema_rate. Needs neither a V network nor multiple actions. Mutually exclusive with --advantage_normalization / --kl_budget(_per_dim) / --one_step_dist_shift_beta / --q_loss_normalization.")
@@ -142,6 +147,24 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
 
     if args.num_denoised_actions < 1:
         parser.error("--num_denoised_actions must be >= 1.")
+
+    if args.best_of_n_actions < 1:
+        parser.error("--best_of_n_actions must be >= 1.")
+
+    if args.best_of_n_actions > 1 and args.best_of_n_noise_scale_init <= 0:
+        parser.error("--best_of_n_noise_scale_init must be > 0 when --best_of_n_actions > 1.")
+
+    if args.best_of_n_actions > 1 and args.best_of_n_noise_lr <= 0:
+        parser.error("--best_of_n_noise_lr must be > 0 when --best_of_n_actions > 1.")
+
+    if args.delay_best_of_n_noise_update <= 0:
+        parser.error("--delay_best_of_n_noise_update must be > 0.")
+
+    if args.best_of_n_actions > 1 and args.best_of_n_noise_target_entropy_scale <= 0:
+        parser.error("--best_of_n_noise_target_entropy_scale must be > 0 when --best_of_n_actions > 1.")
+
+    if args.best_of_n_actions > 1 and args.fused_denoising:
+        parser.error("--best_of_n_actions > 1 is not supported with --fused_denoising in this first implementation.")
 
     if args.batch_advantage_normalization and args.num_denoised_actions < 2:
         parser.error(

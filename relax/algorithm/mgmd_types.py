@@ -31,6 +31,7 @@ from relax.network.actor_critic import ActorCriticParams
 class Diffv2OptStates(NamedTuple):
     q: tuple  # tuple of N optax.OptState, one per Q network
     policy: optax.OptState
+    best_of_n_noise: optax.OptState = None
     value: optax.OptState = None  # Optional V(s) network for normalized advantage guidance
 
 
@@ -90,6 +91,7 @@ class Diffv2TrainState(NamedTuple):
     dist_shift_shape_ema: float = -1.0        # EMA of s₂ = (2γc + κ₃) / v^(3/2), dimensionless shape
     q_running_mean: float = 0.0              # EMA(batch mean of online agg-Q at next-actions); --ema_advantage_normalization
     q_running_std: float = 1.0               # EMA(batch std of online agg-Q at next-actions); guidance Q divisor
+    log_best_of_n_noise_scale: float = 0.0   # log std for DPMD-style post-best-of-N rollout noise
     policy_loss: jax.Array = 0.0             # last computed policy loss; held constant on non-update steps
     hp: HParams = HParams()
 
@@ -131,6 +133,11 @@ class MGMDConfig:
     critic_update_steps: int = 1
     policy_update_steps: int = 1
     num_denoised_actions: int = 1
+    best_of_n_actions: int = 1
+    best_of_n_noise_scale_init: float = 0.5
+    best_of_n_noise_lr: float = 7e-3
+    delay_best_of_n_noise_update: int = 250
+    best_of_n_noise_target_entropy_scale: float = 0.9
     batch_advantage_normalization: bool = False
     q_loss_normalization: bool = False
     ema_advantage_normalization: bool = False
@@ -191,6 +198,11 @@ class MGMDConfig:
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
             guidance_gradient_space=args.guidance_gradient_space,
             num_denoised_actions=args.num_denoised_actions,
+            best_of_n_actions=args.best_of_n_actions,
+            best_of_n_noise_scale_init=args.best_of_n_noise_scale_init,
+            best_of_n_noise_lr=args.best_of_n_noise_lr,
+            delay_best_of_n_noise_update=args.delay_best_of_n_noise_update,
+            best_of_n_noise_target_entropy_scale=args.best_of_n_noise_target_entropy_scale,
             batch_advantage_normalization=args.batch_advantage_normalization,
             q_loss_normalization=args.q_loss_normalization,
             ema_advantage_normalization=args.ema_advantage_normalization,

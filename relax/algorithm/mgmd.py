@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 
 import jax, jax.numpy as jnp
@@ -10,6 +11,7 @@ from relax.algorithm.mgmd_types import (
     Diffv2OptStates,
     HParams,
     Diffv2TrainState,
+    MalaSampleResult,
     MGMDConfig,
 )
 from relax.algorithm.value_head import ValueHead
@@ -58,6 +60,7 @@ class MGMD:
         self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
         # V-free guidance-normalization knobs (see relax/cli/train_args.py).
         self.num_denoised_actions = int(cfg.num_denoised_actions)
+        self.best_of_n_actions = int(cfg.best_of_n_actions)
         self.q_loss_normalization = bool(cfg.q_loss_normalization)
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
@@ -67,6 +70,7 @@ class MGMD:
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
         self.optim = optax.scale_by_adam()
         self.policy_optim = optax.scale_by_adam()
+        self.best_of_n_noise_optim = optax.adam(self.cfg.best_of_n_noise_lr)
 
         # --- Optional V(s) network for KL-budget / on-policy-EMA beta adaptation and logging. ---
         value_params_init, value_opt_state_init = self._setup_value_network(params)
@@ -92,12 +96,14 @@ class MGMD:
             batch_advantage_normalization=self.batch_advantage_normalization,
             ema_advantage_normalization=self.ema_advantage_normalization,
         )
-        sampler = build_mala_sampler(**_sampler_kw)
+        rollout_sampler = build_mala_sampler(
+            **dict(_sampler_kw, num_denoised_actions=self.best_of_n_actions)
+        )
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
         updater = self._stateless_update(build_mala_sampler(**_sampler_kw, compute_final_q=False), agg_critic)
-        stateless_get_action = lambda key, state, obs: sampler(key, state, obs, agg_critic)
+        stateless_get_action = self._stateless_get_action(rollout_sampler, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
 
@@ -162,6 +168,56 @@ class MGMD:
             return jnp.mean(per_elem_loss)
         return jnp.sum(weight * per_elem_loss) / jnp.maximum(jnp.sum(weight), jnp.float32(1.0))
 
+    def _stateless_get_action(self, sampler, agg_sample_fn):
+        """Return rollout sampler closure.
+
+        ``best_of_n_actions=1`` preserves the existing single-sample rollout.
+        ``best_of_n_actions>1`` selects the highest final online-Q candidate and
+        then adds DPMD-style learned Gaussian execution noise. The selected Q is
+        used only for choosing the pre-noise candidate; the returned Q is
+        recomputed at the actually executed noisy action.
+        """
+        def stateless_get_action(key: jax.Array, state: Diffv2TrainState, obs: jax.Array):
+            sample_key, noise_key = jax.random.split(key)
+            result = sampler(sample_key, state, obs, agg_sample_fn)
+            if self.best_of_n_actions == 1:
+                return MalaSampleResult(
+                    action=result.action[0],
+                    q=result.q[0],
+                    log_eta_scales=result.log_eta_scales,
+                    per_level_acc=result.per_level_acc,
+                    per_level_clip=result.per_level_clip,
+                )
+
+            best_idx = jnp.argmax(result.q, axis=0)  # [num_envs]
+            best_action = jnp.take_along_axis(
+                result.action, best_idx[None, :, None], axis=0
+            ).squeeze(axis=0)
+            noise_scale = jnp.exp(state.log_best_of_n_noise_scale)
+            exec_action = best_action + jax.random.normal(noise_key, best_action.shape) * noise_scale
+            exec_q = _aggregate_q(
+                [self.model.q(qp, obs, exec_action) for qp in state.params.q],
+                self.cfg.q_agg_sample,
+            )
+            return MalaSampleResult(
+                action=exec_action,
+                q=exec_q,
+                log_eta_scales=result.log_eta_scales,
+                per_level_acc=result.per_level_acc,
+                per_level_clip=result.per_level_clip,
+            )
+
+        return stateless_get_action
+
+    def _best_of_n_noise_loss(self, log_noise_scale):
+        noise_scale = jnp.exp(log_noise_scale)
+        entropy_approx = jnp.float32(0.5 * self.model.act_dim) * jnp.log(
+            jnp.float32(2.0 * math.pi * math.e) * noise_scale * noise_scale
+        )
+        target_entropy = jnp.float32(-self.cfg.best_of_n_noise_target_entropy_scale * self.model.act_dim)
+        loss = log_noise_scale * jax.lax.stop_gradient(entropy_approx - target_entropy)
+        return loss, entropy_approx
+
     def _stateless_update(self, sampler, agg_sample_fn):
         """Return the ``stateless_update(key, state, data, critic_weight)`` closure.
 
@@ -180,6 +236,7 @@ class MGMD:
             policy_params = state.params.policy
             q_opt_states = state.opt_state.q   # tuple of N opt states
             policy_opt_state = state.opt_state.policy
+            best_of_n_noise_opt_state = state.opt_state.best_of_n_noise
             step = state.step
             num_q = len(q_params)
             next_eval_key, diffusion_time_key, diffusion_noise_key = jax.random.split(key, 3)
@@ -313,14 +370,43 @@ class MGMD:
                 step % self.cfg.delay_update == 0, _do,
                 lambda _: (state.policy_loss, policy_params, policy_opt_state), None)
 
+            log_best_of_n_noise_scale = state.log_best_of_n_noise_scale
+            best_of_n_noise_loss = jnp.float32(0.0)
+            best_of_n_noise_entropy = jnp.float32(0.0)
+            if self.best_of_n_actions > 1:
+                def _update_noise(_):
+                    (loss, entropy_approx), grads = jax.value_and_grad(
+                        self._best_of_n_noise_loss, has_aux=True
+                    )(log_best_of_n_noise_scale)
+                    updates, new_opt_state = self.best_of_n_noise_optim.update(
+                        grads, best_of_n_noise_opt_state, params=log_best_of_n_noise_scale
+                    )
+                    new_log_noise = optax.apply_updates(log_best_of_n_noise_scale, updates)
+                    return new_log_noise, new_opt_state, loss, entropy_approx
 
+                def _skip_noise(_):
+                    loss, entropy_approx = self._best_of_n_noise_loss(log_best_of_n_noise_scale)
+                    return log_best_of_n_noise_scale, best_of_n_noise_opt_state, loss, entropy_approx
+
+                log_best_of_n_noise_scale, best_of_n_noise_opt_state, best_of_n_noise_loss, best_of_n_noise_entropy = jax.lax.cond(
+                    step % self.cfg.delay_best_of_n_noise_update == 0,
+                    _update_noise,
+                    _skip_noise,
+                    None,
+                )
 
             state = state._replace(
                 params=ActorCriticParams(q_params, target_q_params, policy_params),
-                opt_state=Diffv2OptStates(q=q_opt_states, policy=policy_opt_state, value=value_opt_state_updated),
+                opt_state=Diffv2OptStates(
+                    q=q_opt_states,
+                    policy=policy_opt_state,
+                    best_of_n_noise=best_of_n_noise_opt_state,
+                    value=value_opt_state_updated,
+                ),
                 step=step + 1,
                 log_eta_scales=mala_result.log_eta_scales,
                 value_params=value_params_updated,
+                log_best_of_n_noise_scale=log_best_of_n_noise_scale,
                 policy_loss=total_loss,
                 advantage_second_moment_ema=new_adv_m2_ema,
                 q_running_mean=new_q_running_mean,
@@ -336,6 +422,11 @@ class MGMD:
                 info["lr/anneal_factor"] = lr_factor
                 info["lr/lr_q"] = lr_q_eff
                 info["lr/lr_policy"] = lr_policy_eff
+            if self.best_of_n_actions > 1:
+                info["BestOfN/noise_scale"] = jnp.exp(log_best_of_n_noise_scale)
+                info["BestOfN/noise_entropy_approx"] = best_of_n_noise_entropy
+                info["BestOfN/noise_loss"] = best_of_n_noise_loss
+                info["BestOfN/num_actions"] = jnp.float32(self.best_of_n_actions)
 
             # V_MSE: only when V network exists
             if self.on_policy_ema and state.value_params is not None:
@@ -433,10 +524,10 @@ class MGMD:
         result = self._jit_vmap_get_action(key, self.state, obs)
         # log_eta_scales: shape [N, timesteps] — matches stacked state layout.
         self.state = self.state._replace(log_eta_scales=result.log_eta_scales)
-        # Sampler returns K iid actions per state ([N, K, num_envs, ...]); index 0
-        # is a uniform draw. Take it (and its raw Q) to step the environment.
-        action_np = np.asarray(result.action[:, 0])  # [N, num_envs, act_dim]
-        q_per_env = np.asarray(result.q[:, 0])       # [N, num_envs]
+        # _stateless_get_action already returns the selected rollout action:
+        # index-0 for best_of_n_actions=1, or best-of-N plus learned noise for N>1.
+        action_np = np.asarray(result.action)  # [N, num_envs, act_dim]
+        q_per_env = np.asarray(result.q)       # [N, num_envs]
 
         if not self.on_policy_ema:
             return action_np, q_per_env, None
@@ -479,6 +570,9 @@ class MGMD:
             opt_state=Diffv2OptStates(
                 q=tuple(self.optim.init(qp) for qp in params.q),
                 policy=self.policy_optim.init(params.policy),
+                best_of_n_noise=self.best_of_n_noise_optim.init(
+                    jnp.float32(math.log(cfg.best_of_n_noise_scale_init))
+                ),
                 value=value_opt_state_init,
             ),
             step=jnp.int32(0),
@@ -491,6 +585,7 @@ class MGMD:
             dist_shift_shape_ema=jnp.float32(cfg.initial_dist_shift_shape_ema),
             q_running_mean=jnp.float32(0.0),
             q_running_std=jnp.float32(1.0),
+            log_best_of_n_noise_scale=jnp.float32(math.log(cfg.best_of_n_noise_scale_init)),
             hp=HParams(
                 gamma=jnp.float32(cfg.gamma),
                 polyak_tau=jnp.float32(cfg.polyak_tau),
@@ -540,6 +635,7 @@ class MGMD:
         return {
             "lr_policy_effective": float(self.cfg.lr_policy),
             "lr_q_effective": float(self.cfg.lr_q),
+            "best_of_n_noise_scale_init_effective": float(self.cfg.best_of_n_noise_scale_init),
         }
 
 
