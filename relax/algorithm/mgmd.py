@@ -189,10 +189,11 @@ class MGMD:
                     per_level_clip=result.per_level_clip,
                 )
 
-            best_idx = jnp.argmax(result.q, axis=0)  # [num_envs]
-            best_action = jnp.take_along_axis(
-                result.action, best_idx[None, :, None], axis=0
-            ).squeeze(axis=0)
+            best_idx = jnp.argmax(result.q, axis=0)
+            gather_idx = best_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            best_action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
             noise_scale = jnp.exp(state.log_best_of_n_noise_scale)
             exec_action = best_action + jax.random.normal(noise_key, best_action.shape) * noise_scale
             exec_q = _aggregate_q(
