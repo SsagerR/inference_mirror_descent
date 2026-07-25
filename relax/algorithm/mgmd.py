@@ -6,6 +6,7 @@ import numpy as np
 import optax
 import haiku as hk
 
+from relax.algorithm.diffusion_sampler import build_diffusion_sampler
 from relax.algorithm.mala_sampler import build_mala_sampler
 from relax.algorithm.mgmd_types import (
     Diffv2OptStates,
@@ -58,6 +59,8 @@ class MGMD:
         self.use_advantage_stats = bool(cfg.advantage_normalization or cfg.kl_budget is not None)
         self.on_policy_ema = self.use_advantage_stats
         self.one_step_dist_shift_beta = bool(cfg.one_step_dist_shift_beta)
+        self.mgmd_variant = cfg.mgmd_variant
+        self.rsm_variant = self.mgmd_variant == "rsm"
         # V-free guidance-normalization knobs (see relax/cli/train_args.py).
         self.num_denoised_actions = int(cfg.num_denoised_actions)
         self.best_of_n_actions = int(cfg.best_of_n_actions)
@@ -73,7 +76,11 @@ class MGMD:
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
         self.lr_anneal = bool(cfg.lr_anneal)
-        self.policy_loss_key = "losses/Policy_epsilon_MSE"
+        self.policy_loss_key = (
+            "losses/Policy_RSM_weighted_epsilon_MSE"
+            if self.rsm_variant else
+            "losses/Policy_epsilon_MSE"
+        )
 
         # --- Optimizers: unscaled Adam; per-seed state.lr_{q,policy} is applied at update time. ---
         self.optim = optax.scale_by_adam()
@@ -93,7 +100,8 @@ class MGMD:
         self._snr = self._alphas_cumprod / np.maximum(1.0 - self._alphas_cumprod, 1e-8)
 
         # --- Stateless update / sampler closures (jit-able, vmap-able). ---
-        # Build the MALA sampler; body lives in relax.algorithm.mala_sampler.
+        # Default MGMD uses MALA-guided sampling. The RSM variant binds to a
+        # plain DDPM sampler for both rollout and TD next-action sampling.
         _sampler_kw = dict(
             model=self.model, value_head=self.value_head, timesteps=self._timesteps,
             batch_independent_guidance=self.cfg.batch_independent_guidance,
@@ -104,22 +112,36 @@ class MGMD:
             batch_advantage_normalization=self.batch_advantage_normalization,
             ema_advantage_normalization=self.ema_advantage_normalization,
         )
-        rollout_sampler = build_mala_sampler(
-            **dict(_sampler_kw, num_denoised_actions=self.best_of_n_actions)
-        )
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
-        if self.best_of_n_td_action_sampling:
-            td_sampler = self._stateless_best_of_n_training_sampler(
-                build_mala_sampler(
-                    **dict(_sampler_kw, num_denoised_actions=self.best_of_n_td_actions)
-                )
+        if self.rsm_variant:
+            rollout_sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=1,
             )
-            training_num_actions = 1
-        else:
-            td_sampler = build_mala_sampler(**_sampler_kw, compute_final_q=False)
+            td_sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=self.num_denoised_actions,
+                compute_final_q=False,
+            )
             training_num_actions = self.num_denoised_actions
+        else:
+            rollout_sampler = build_mala_sampler(
+                **dict(_sampler_kw, num_denoised_actions=self.best_of_n_actions)
+            )
+            if self.best_of_n_td_action_sampling:
+                td_sampler = self._stateless_best_of_n_training_sampler(
+                    build_mala_sampler(
+                        **dict(_sampler_kw, num_denoised_actions=self.best_of_n_td_actions)
+                    )
+                )
+                training_num_actions = 1
+            else:
+                td_sampler = build_mala_sampler(**_sampler_kw, compute_final_q=False)
+                training_num_actions = self.num_denoised_actions
         updater = self._stateless_update(td_sampler, agg_critic, training_num_actions)
         stateless_get_action = self._stateless_get_action(rollout_sampler, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
@@ -281,7 +303,7 @@ class MGMD:
     def _stateless_update(self, sampler, agg_sample_fn, training_num_actions: int):
         """Return the ``stateless_update(key, state, data, critic_weight)`` closure.
 
-        Captures ``sampler`` (MALA sampler) and ``agg_sample_fn`` (Q aggregation
+        Captures ``sampler`` (MALA or plain diffusion sampler) and ``agg_sample_fn`` (Q aggregation
         used when sampling the TD next-action; distinct from the backup target
         which is hardcoded to 'min'). Called once from ``__init__``; the result
         is wrapped with ``jax.jit(jax.vmap(...))`` and stored as
@@ -372,11 +394,13 @@ class MGMD:
             # tracked for logging (it cancels in the guidance gradient).
             new_q_running_mean = state.q_running_mean
             new_q_running_std = state.q_running_std
-            if self.ema_advantage_normalization:
+            q_norm_samples = None
+            if self.ema_advantage_normalization or self.rsm_variant:
                 q_norm_samples = _aggregate_q(
                     [self.model.q(qp, next_obs_k, tilted_actions) for qp in q_params],
                     self.cfg.q_agg_sample,
                 )  # [K, batch] online Q at the tilted next-actions
+            if self.ema_advantage_normalization:
                 rate = state.hp.adv_norm_ema_rate
                 new_q_running_mean = state.q_running_mean + rate * (jnp.mean(q_norm_samples) - state.q_running_mean)
                 new_q_running_std = state.q_running_std + rate * (jnp.std(q_norm_samples) - state.q_running_std)
@@ -388,11 +412,20 @@ class MGMD:
             # K=1 these are exactly the previous [batch, ...] tensors).
             policy_targets = tilted_actions.reshape(K * obs.shape[0], -1)   # [K*batch, act_dim]
             policy_obs = next_obs_k.reshape(K * obs.shape[0], -1)           # [K*batch, obs_dim]
+            rsm_q_used = jnp.zeros((policy_targets.shape[0],), dtype=policy_targets.dtype)
+            rsm_scaled_q = jnp.zeros((policy_targets.shape[0],), dtype=policy_targets.dtype)
+            rsm_weights = jnp.ones((policy_targets.shape[0], 1), dtype=policy_targets.dtype)
+            if self.rsm_variant:
+                q_for_rsm = q_norm_samples.reshape(K * obs.shape[0])
+                if self.ema_advantage_normalization:
+                    q_for_rsm = (q_for_rsm - state.q_running_mean) / jnp.maximum(state.q_running_std, jnp.float32(1e-6))
+                rsm_q_used = q_for_rsm
+                rsm_scaled_q = jnp.clip(state.beta * q_for_rsm, jnp.float32(-3.0), jnp.float32(3.0))
+                rsm_weights = jax.lax.stop_gradient(jnp.exp(rsm_scaled_q))[..., None]
 
             def policy_loss_fn(policy_params, time_key, noise_key) -> jax.Array:
-                # Standard diffusion score-matching loss (eps-MSE) against the K
-                # tilted target actions sampled above. Uses optax.squared_error
-                # (== (x-y)**2), NOT optax.l2_loss (== 0.5*(x-y)**2).
+                # Default MGMD: unweighted eps-MSE distillation. RSM variant:
+                # same diffusion target actions, weighted by exp(beta * Q_used).
                 t = jax.random.randint(
                     time_key,
                     (policy_targets.shape[0],),
@@ -402,7 +435,10 @@ class MGMD:
                 noise = jax.random.normal(noise_key, policy_targets.shape)
                 tilted_action_noisy = self.model.q_sample(t, policy_targets, noise)
                 noise_pred = self.model.eps_pred(policy_params, policy_obs, tilted_action_noisy, t)
-                return optax.squared_error(noise_pred, noise).mean()
+                per_dim_loss = optax.squared_error(noise_pred, noise)
+                if self.rsm_variant:
+                    return (rsm_weights * per_dim_loss).mean()
+                return per_dim_loss.mean()
 
             def _do(_):
                 updated_policy_params = policy_params
@@ -493,6 +529,16 @@ class MGMD:
                 info["BestOfN/rollout_num_actions"] = jnp.float32(self.best_of_n_actions)
                 info["BestOfN/td_num_actions"] = jnp.float32(self.best_of_n_td_actions)
                 info["BestOfN/td_action_sampling"] = jnp.float32(self.best_of_n_td_action_sampling)
+            if self.rsm_variant:
+                info["RSM/q_used_mean"] = jnp.mean(rsm_q_used)
+                info["RSM/q_used_std"] = jnp.std(rsm_q_used)
+                info["RSM/scaled_q_mean"] = jnp.mean(rsm_scaled_q)
+                info["RSM/scaled_q_std"] = jnp.std(rsm_scaled_q)
+                info["RSM/weights_mean"] = jnp.mean(rsm_weights)
+                info["RSM/weights_std"] = jnp.std(rsm_weights)
+                info["RSM/weights_min"] = jnp.min(rsm_weights)
+                info["RSM/weights_max"] = jnp.max(rsm_weights)
+                info["RSM/num_denoised_actions"] = jnp.float32(self.num_denoised_actions)
 
             # V_MSE: only when V network exists
             if self.on_policy_ema and state.value_params is not None:
@@ -699,6 +745,7 @@ class MGMD:
 
     def get_effective_hparams(self) -> dict:
         return {
+            "mgmd_variant_effective": self.cfg.mgmd_variant,
             "lr_policy_effective": float(self.cfg.lr_policy),
             "lr_q_effective": float(self.cfg.lr_q),
             "best_of_n_noise_scale_init_effective": float(self.cfg.best_of_n_noise_scale_init),

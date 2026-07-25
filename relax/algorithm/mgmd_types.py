@@ -110,6 +110,7 @@ class MGMDConfig:
     lr_q: float = 1e-4
     delay_update: int = 2
     reward_scale: float = 0.2
+    mgmd_variant: str = "mgmd"
     q_agg_sample: str = "min"
     beta: float = 0.0
     x0_hat_clip_radius: float = 1.0
@@ -179,6 +180,7 @@ class MGMDConfig:
             critic_update_steps=args.critic_update_steps,
             policy_update_steps=args.policy_update_steps,
             reward_scale=args.reward_scale,
+            mgmd_variant=args.mgmd_variant,
             q_agg_sample=args.q_agg_sample,
             beta=args.beta,
             x0_hat_clip_radius=args.x0_hat_clip_radius,

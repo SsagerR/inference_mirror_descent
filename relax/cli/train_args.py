@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- env / run control -------------------------------------------------
     parser.add_argument("--alg", type=str, default="mgmd", choices=["mgmd"])
+    parser.add_argument("--mgmd_variant", type=str, default="mgmd", choices=["mgmd", "rsm"], help="'mgmd' keeps the current MALA-guided sampler + sampler-distillation policy update. 'rsm' uses an unguided DDPM diffusion sampler for rollout and TD next-action sampling, then updates the policy with RSM-weighted diffusion loss.")
     parser.add_argument("--env", type=str, default="HalfCheetah-v3")
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--num_vec_envs", type=int, default=5)
@@ -159,6 +160,13 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if args.best_of_n_td_actions < 1:
         parser.error("--best_of_n_td_actions must be >= 1.")
 
+    if args.mgmd_variant == "rsm" and (
+        args.best_of_n_actions != 1
+        or args.best_of_n_td_action_sampling
+        or args.best_of_n_td_actions != 1
+    ):
+        parser.error("--mgmd_variant rsm does not support best-of-N options in this implementation.")
+
     if args.best_of_n_td_action_sampling and args.num_denoised_actions != 1:
         parser.error("--best_of_n_td_action_sampling currently requires --num_denoised_actions 1.")
 
@@ -245,5 +253,5 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--policy_update_steps must be > 0.")
     if args.delay_update <= 0:
         parser.error("--delay_update must be > 0.")
-    if args.mala_steps <= 0:
+    if args.mgmd_variant == "mgmd" and args.mala_steps <= 0:
         parser.error("--mala_steps must be > 0; the non-MALA sampling branches have been removed.")
