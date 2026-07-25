@@ -134,6 +134,7 @@ class MGMDConfig:
     policy_update_steps: int = 1
     num_denoised_actions: int = 1
     best_of_n_actions: int = 1
+    best_of_n_td_action_sampling: bool = False
     best_of_n_noise_scale_init: float = 0.5
     best_of_n_noise_lr: float = 7e-3
     delay_best_of_n_noise_update: int = 250
@@ -199,6 +200,7 @@ class MGMDConfig:
             guidance_gradient_space=args.guidance_gradient_space,
             num_denoised_actions=args.num_denoised_actions,
             best_of_n_actions=args.best_of_n_actions,
+            best_of_n_td_action_sampling=args.best_of_n_td_action_sampling,
             best_of_n_noise_scale_init=args.best_of_n_noise_scale_init,
             best_of_n_noise_lr=args.best_of_n_noise_lr,
             delay_best_of_n_noise_update=args.delay_best_of_n_noise_update,

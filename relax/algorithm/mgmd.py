@@ -61,6 +61,7 @@ class MGMD:
         # V-free guidance-normalization knobs (see relax/cli/train_args.py).
         self.num_denoised_actions = int(cfg.num_denoised_actions)
         self.best_of_n_actions = int(cfg.best_of_n_actions)
+        self.best_of_n_td_action_sampling = bool(cfg.best_of_n_td_action_sampling)
         self.q_loss_normalization = bool(cfg.q_loss_normalization)
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
@@ -102,7 +103,17 @@ class MGMD:
         # Both sampling paths (rollout + TD next-action) use --q_agg_sample aggregation.
         # The TD-backup target itself remains hardcoded to 'min' (clipped double-Q).
         agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
-        updater = self._stateless_update(build_mala_sampler(**_sampler_kw, compute_final_q=False), agg_critic)
+        if self.best_of_n_td_action_sampling:
+            td_sampler = self._stateless_best_of_n_training_sampler(
+                build_mala_sampler(
+                    **dict(_sampler_kw, num_denoised_actions=self.best_of_n_actions)
+                )
+            )
+            training_num_actions = 1
+        else:
+            td_sampler = build_mala_sampler(**_sampler_kw, compute_final_q=False)
+            training_num_actions = self.num_denoised_actions
+        updater = self._stateless_update(td_sampler, agg_critic, training_num_actions)
         stateless_get_action = self._stateless_get_action(rollout_sampler, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
@@ -210,6 +221,47 @@ class MGMD:
 
         return stateless_get_action
 
+    def _stateless_best_of_n_training_sampler(self, sampler):
+        """Return a TD next-action sampler with DPMD-style best-of-N selection.
+
+        The wrapped sampler emits N candidate actions per replay state. This
+        closure selects the highest final online-Q candidate, adds the same
+        learned Gaussian best-of-N noise used by rollout, recomputes online Q at
+        the executed action, and restores a leading singleton action axis so the
+        training update can keep its [K, batch, ...] tensor convention.
+        """
+        def stateless_best_of_n_training_sampler(
+            key: jax.Array,
+            state: Diffv2TrainState,
+            obs: jax.Array,
+            aggregate_q_fn,
+        ):
+            sample_key, noise_key = jax.random.split(key)
+            result = sampler(sample_key, state, obs, aggregate_q_fn)
+            if self.best_of_n_actions == 1:
+                return result
+
+            best_idx = jnp.argmax(result.q, axis=0)
+            gather_idx = best_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            best_action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
+
+            noise_scale = jnp.exp(state.log_best_of_n_noise_scale)
+            exec_action = best_action + jax.random.normal(noise_key, best_action.shape) * noise_scale
+            exec_q = aggregate_q_fn(
+                [self.model.q(qp, obs, exec_action) for qp in state.params.q],
+            )
+            return MalaSampleResult(
+                action=exec_action[None, ...],
+                q=exec_q[None, ...],
+                log_eta_scales=result.log_eta_scales,
+                per_level_acc=result.per_level_acc,
+                per_level_clip=result.per_level_clip,
+            )
+
+        return stateless_best_of_n_training_sampler
+
     def _best_of_n_noise_loss(self, log_noise_scale):
         noise_scale = jnp.exp(log_noise_scale)
         entropy_approx = jnp.float32(0.5 * self.model.act_dim) * jnp.log(
@@ -219,7 +271,7 @@ class MGMD:
         loss = log_noise_scale * jax.lax.stop_gradient(entropy_approx - target_entropy)
         return loss, entropy_approx
 
-    def _stateless_update(self, sampler, agg_sample_fn):
+    def _stateless_update(self, sampler, agg_sample_fn, training_num_actions: int):
         """Return the ``stateless_update(key, state, data, critic_weight)`` closure.
 
         Captures ``sampler`` (MALA sampler) and ``agg_sample_fn`` (Q aggregation
@@ -262,10 +314,13 @@ class MGMD:
 
             reward *= state.hp.reward_scale
 
-            # Denoise K tilted next-actions per state (K = num_denoised_actions).
+            # Denoise K tilted next-actions per replay state. By default
+            # K = num_denoised_actions. With --best_of_n_td_action_sampling,
+            # the sampler internally denoises N=best_of_n_actions candidates,
+            # selects one DPMD-style action, and returns it as K=1.
             mala_result = sampler(next_eval_key, state, next_obs, agg_sample_fn)
             tilted_actions = mala_result.action           # [K, batch, act_dim]
-            K = self.num_denoised_actions
+            K = training_num_actions
             next_obs_k = jnp.broadcast_to(next_obs, (K, *next_obs.shape))
 
             # Clipped double Q-learning: min_i(target_Q_i) per action, then the
@@ -428,6 +483,7 @@ class MGMD:
                 info["BestOfN/noise_entropy_approx"] = best_of_n_noise_entropy
                 info["BestOfN/noise_loss"] = best_of_n_noise_loss
                 info["BestOfN/num_actions"] = jnp.float32(self.best_of_n_actions)
+                info["BestOfN/td_action_sampling"] = jnp.float32(self.best_of_n_td_action_sampling)
 
             # V_MSE: only when V network exists
             if self.on_policy_ema and state.value_params is not None:
@@ -637,6 +693,7 @@ class MGMD:
             "lr_policy_effective": float(self.cfg.lr_policy),
             "lr_q_effective": float(self.cfg.lr_q),
             "best_of_n_noise_scale_init_effective": float(self.cfg.best_of_n_noise_scale_init),
+            "best_of_n_td_action_sampling_effective": bool(self.cfg.best_of_n_td_action_sampling),
         }
 
 

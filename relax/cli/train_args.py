@@ -97,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ----- multi-action denoising + V-free advantage normalization ----------
     parser.add_argument("--num_denoised_actions", type=int, default=1, help="Training-time number K of denoised next-actions per sampled replay state. The TD backup averages clipped-double-Q over these K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. This is separate from rollout-time --best_of_n_actions. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
     parser.add_argument("--best_of_n_actions", type=int, default=1, help="Rollout-time best-of-N candidate count. N=1 preserves the current uniform single-sample rollout exactly. N>1 denoises N candidate actions at the current env state, picks the highest final online --q_agg_sample Q candidate, then adds DPMD-style learned Gaussian execution noise with std exp(log_best_of_n_noise_scale). Separate from training-time --num_denoised_actions.")
+    parser.add_argument("--best_of_n_td_action_sampling", action="store_true", default=False, help="Also use DPMD-style best-of-N for TD next-action sampling. When set, the training TD sampler denoises --best_of_n_actions candidates at s', selects the highest final online --q_agg_sample Q candidate, adds the same learned Gaussian best-of-N noise, and returns that single action for both the TD backup and policy distillation. Requires --num_denoised_actions 1.")
     parser.add_argument("--best_of_n_noise_scale_init", type=float, default=0.5, help="Initial std for learned post-best-of-N rollout Gaussian noise. Default 0.5 matches DPMD's exp(log(5))*noise_scale with noise_scale=0.1.")
     parser.add_argument("--best_of_n_noise_lr", type=float, default=7e-3, help="Adam learning rate for the DPMD-style best-of-N rollout noise scheduler. Used only when --best_of_n_actions > 1.")
     parser.add_argument("--delay_best_of_n_noise_update", type=int, default=250, help="Update the best-of-N rollout noise scheduler every this many MGMD update steps. Used only when --best_of_n_actions > 1.")
@@ -150,6 +151,9 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
 
     if args.best_of_n_actions < 1:
         parser.error("--best_of_n_actions must be >= 1.")
+
+    if args.best_of_n_td_action_sampling and args.num_denoised_actions != 1:
+        parser.error("--best_of_n_td_action_sampling currently requires --num_denoised_actions 1.")
 
     if args.best_of_n_actions > 1 and args.best_of_n_noise_scale_init <= 0:
         parser.error("--best_of_n_noise_scale_init must be > 0 when --best_of_n_actions > 1.")
