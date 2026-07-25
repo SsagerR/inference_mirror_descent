@@ -62,6 +62,13 @@ class MGMD:
         self.num_denoised_actions = int(cfg.num_denoised_actions)
         self.best_of_n_actions = int(cfg.best_of_n_actions)
         self.best_of_n_td_action_sampling = bool(cfg.best_of_n_td_action_sampling)
+        self.best_of_n_td_actions = int(
+            cfg.best_of_n_td_actions if cfg.best_of_n_td_actions is not None else cfg.best_of_n_actions
+        )
+        self.uses_best_of_n_noise = (
+            self.best_of_n_actions > 1
+            or (self.best_of_n_td_action_sampling and self.best_of_n_td_actions > 1)
+        )
         self.q_loss_normalization = bool(cfg.q_loss_normalization)
         self.batch_advantage_normalization = bool(cfg.batch_advantage_normalization)
         self.ema_advantage_normalization = bool(cfg.ema_advantage_normalization)
@@ -106,7 +113,7 @@ class MGMD:
         if self.best_of_n_td_action_sampling:
             td_sampler = self._stateless_best_of_n_training_sampler(
                 build_mala_sampler(
-                    **dict(_sampler_kw, num_denoised_actions=self.best_of_n_actions)
+                    **dict(_sampler_kw, num_denoised_actions=self.best_of_n_td_actions)
                 )
             )
             training_num_actions = 1
@@ -238,7 +245,7 @@ class MGMD:
         ):
             sample_key, noise_key = jax.random.split(key)
             result = sampler(sample_key, state, obs, aggregate_q_fn)
-            if self.best_of_n_actions == 1:
+            if self.best_of_n_td_actions == 1:
                 return result
 
             best_idx = jnp.argmax(result.q, axis=0)
@@ -316,7 +323,7 @@ class MGMD:
 
             # Denoise K tilted next-actions per replay state. By default
             # K = num_denoised_actions. With --best_of_n_td_action_sampling,
-            # the sampler internally denoises N=best_of_n_actions candidates,
+            # the sampler internally denoises N=best_of_n_td_actions candidates,
             # selects one DPMD-style action, and returns it as K=1.
             mala_result = sampler(next_eval_key, state, next_obs, agg_sample_fn)
             tilted_actions = mala_result.action           # [K, batch, act_dim]
@@ -429,7 +436,7 @@ class MGMD:
             log_best_of_n_noise_scale = state.log_best_of_n_noise_scale
             best_of_n_noise_loss = jnp.float32(0.0)
             best_of_n_noise_entropy = jnp.float32(0.0)
-            if self.best_of_n_actions > 1:
+            if self.uses_best_of_n_noise:
                 def _update_noise(_):
                     (loss, entropy_approx), grads = jax.value_and_grad(
                         self._best_of_n_noise_loss, has_aux=True
@@ -478,11 +485,13 @@ class MGMD:
                 info["lr/anneal_factor"] = lr_factor
                 info["lr/lr_q"] = lr_q_eff
                 info["lr/lr_policy"] = lr_policy_eff
-            if self.best_of_n_actions > 1:
+            if self.uses_best_of_n_noise:
                 info["BestOfN/noise_scale"] = jnp.exp(log_best_of_n_noise_scale)
                 info["BestOfN/noise_entropy_approx"] = best_of_n_noise_entropy
                 info["BestOfN/noise_loss"] = best_of_n_noise_loss
                 info["BestOfN/num_actions"] = jnp.float32(self.best_of_n_actions)
+                info["BestOfN/rollout_num_actions"] = jnp.float32(self.best_of_n_actions)
+                info["BestOfN/td_num_actions"] = jnp.float32(self.best_of_n_td_actions)
                 info["BestOfN/td_action_sampling"] = jnp.float32(self.best_of_n_td_action_sampling)
 
             # V_MSE: only when V network exists
@@ -694,6 +703,7 @@ class MGMD:
             "lr_q_effective": float(self.cfg.lr_q),
             "best_of_n_noise_scale_init_effective": float(self.cfg.best_of_n_noise_scale_init),
             "best_of_n_td_action_sampling_effective": bool(self.cfg.best_of_n_td_action_sampling),
+            "best_of_n_td_actions_effective": int(self.best_of_n_td_actions),
         }
 
 
