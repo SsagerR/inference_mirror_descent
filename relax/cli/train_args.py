@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- env / run control -------------------------------------------------
     parser.add_argument("--alg", type=str, default="mgmd", choices=["mgmd"])
-    parser.add_argument("--mgmd_variant", type=str, default="mgmd", choices=["mgmd", "rsm"], help="'mgmd' keeps the current MALA-guided sampler + sampler-distillation policy update. 'rsm' uses an unguided DDPM diffusion sampler for rollout and TD next-action sampling, then updates the policy with RSM-weighted diffusion loss.")
+    parser.add_argument("--mgmd_variant", type=str, default="mgmd", choices=["mgmd", "rsm", "soft_resample"], help="'mgmd' keeps the current MALA-guided sampler + sampler-distillation policy update. 'rsm' uses an unguided DDPM diffusion sampler for rollout and TD next-action sampling, then updates the policy with RSM-weighted diffusion loss. 'soft_resample' samples N unguided diffusion candidates and resamples from the per-state Boltzmann weights exp(beta * processed_Q).")
     parser.add_argument("--env", type=str, default="HalfCheetah-v3")
     parser.add_argument("--suffix", type=str, default="")
     parser.add_argument("--num_vec_envs", type=int, default=5)
@@ -97,6 +97,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- multi-action denoising + V-free advantage normalization ----------
     parser.add_argument("--num_denoised_actions", type=int, default=1, help="Training-time number K of denoised next-actions per sampled replay state. The TD backup averages clipped-double-Q over these K actions, and the diffusion policy regresses toward all K. K>=2 is required for --batch_advantage_normalization. This is separate from rollout-time --best_of_n_actions. Changes tensor shapes, so it is a 'hard' (non-vmap-packable) sweep axis in launch.py. Default 1.")
+    parser.add_argument("--soft_resample_actions", type=int, default=1, help="Candidate count N for --mgmd_variant soft_resample. The sampler draws N unguided diffusion actions per state, forms per-state Boltzmann weights from exp(beta * processed_Q), resamples one action for rollout/TD backup, and trains the diffusion policy against all N candidates with those normalized weights. This is a hard sweep axis because it changes JAX tensor shapes.")
+    parser.add_argument("--soft_resample_ess_dump_interval", type=int, default=0, help="Env-step interval for logging full soft-resample ESS/pmax histograms. Scalar ESS/pmax summaries are still logged at the normal update logging cadence. Default 0 disables full histogram dumps.")
     parser.add_argument("--best_of_n_actions", type=int, default=1, help="Rollout-time best-of-N candidate count. N=1 preserves the current uniform single-sample rollout exactly. N>1 denoises N candidate actions at the current env state, picks the highest final online --q_agg_sample Q candidate, then adds DPMD-style learned Gaussian execution noise with std exp(log_best_of_n_noise_scale). Separate from training-time --num_denoised_actions.")
     parser.add_argument("--best_of_n_td_action_sampling", action="store_true", default=False, help="Also use DPMD-style best-of-N for TD next-action sampling. When set, the training TD sampler denoises --best_of_n_td_actions candidates at s', selects the highest final online --q_agg_sample Q candidate, adds the same learned Gaussian best-of-N noise, and returns that single action for both the TD backup and policy distillation. Requires --num_denoised_actions 1.")
     parser.add_argument("--best_of_n_td_actions", type=int, default=None, help="TD next-action best-of-N candidate count used only with --best_of_n_td_action_sampling. Defaults to --best_of_n_actions for backward compatibility, so old commands keep their previous rollout+TD behavior. This is a hard sweep axis because it changes JAX sampler shapes.")
@@ -151,6 +153,9 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if args.num_denoised_actions < 1:
         parser.error("--num_denoised_actions must be >= 1.")
 
+    if args.soft_resample_actions < 1:
+        parser.error("--soft_resample_actions must be >= 1.")
+
     if args.best_of_n_actions < 1:
         parser.error("--best_of_n_actions must be >= 1.")
 
@@ -160,12 +165,15 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if args.best_of_n_td_actions < 1:
         parser.error("--best_of_n_td_actions must be >= 1.")
 
-    if args.mgmd_variant == "rsm" and (
+    if args.mgmd_variant in {"rsm", "soft_resample"} and (
         args.best_of_n_actions != 1
         or args.best_of_n_td_action_sampling
         or args.best_of_n_td_actions != 1
     ):
-        parser.error("--mgmd_variant rsm does not support best-of-N options in this implementation.")
+        parser.error(f"--mgmd_variant {args.mgmd_variant} does not support best-of-N options in this implementation.")
+
+    if args.mgmd_variant == "soft_resample" and args.fused_denoising:
+        parser.error("--mgmd_variant soft_resample is not supported with --fused_denoising in this first implementation.")
 
     if args.best_of_n_td_action_sampling and args.num_denoised_actions != 1:
         parser.error("--best_of_n_td_action_sampling currently requires --num_denoised_actions 1.")
@@ -189,10 +197,11 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
     if uses_best_of_n_noise and args.fused_denoising:
         parser.error("best-of-N samplers with N > 1 are not supported with --fused_denoising in this first implementation.")
 
-    if args.batch_advantage_normalization and args.num_denoised_actions < 2:
+    batch_adv_sample_count = args.soft_resample_actions if args.mgmd_variant == "soft_resample" else args.num_denoised_actions
+    if args.batch_advantage_normalization and batch_adv_sample_count < 2:
         parser.error(
             "--batch_advantage_normalization needs the per-state Q variance over "
-            "the denoised actions, so it requires --num_denoised_actions >= 2."
+            "the denoised actions, so it requires at least two candidates."
         )
 
     # --q_loss_normalization drives the same beta/sqrt(E[A^2]-slot) rescale as the

@@ -48,6 +48,11 @@ class MalaSampleResult(NamedTuple):
     log_eta_scales: jax.Array
     per_level_acc: jax.Array
     per_level_clip: jax.Array
+    candidate_action: jax.Array = None
+    weights: jax.Array = None
+    ess: jax.Array = None
+    pmax: jax.Array = None
+    selected_idx: jax.Array = None
 
 
 class HParams(NamedTuple):
@@ -134,6 +139,8 @@ class MGMDConfig:
     critic_update_steps: int = 1
     policy_update_steps: int = 1
     num_denoised_actions: int = 1
+    soft_resample_actions: int = 1
+    soft_resample_ess_dump_interval: int = 10000
     best_of_n_actions: int = 1
     best_of_n_td_action_sampling: bool = False
     best_of_n_td_actions: Optional[int] = None
@@ -202,6 +209,8 @@ class MGMDConfig:
             one_step_dist_shift_beta=args.one_step_dist_shift_beta,
             guidance_gradient_space=args.guidance_gradient_space,
             num_denoised_actions=args.num_denoised_actions,
+            soft_resample_actions=args.soft_resample_actions,
+            soft_resample_ess_dump_interval=args.soft_resample_ess_dump_interval,
             best_of_n_actions=args.best_of_n_actions,
             best_of_n_td_action_sampling=args.best_of_n_td_action_sampling,
             best_of_n_td_actions=args.best_of_n_td_actions,
