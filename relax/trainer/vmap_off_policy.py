@@ -15,6 +15,7 @@ Layout (Option B):
 """
 from pathlib import Path
 from typing import List, Optional
+import csv
 import os
 
 import jax
@@ -88,6 +89,11 @@ class VmapOffPolicyTrainer:
         diagnostic_snapshot_steps: Optional[List[int]] = None,
         diagnostic_snapshot_batch_size: int = 256,
         diagnostic_snapshot_dir: Optional[str] = None,
+        eval_envs: Optional[List[Env]] = None,
+        eval_every: int = 0,
+        eval_n_episodes: int = 10,
+        eval_best_of_n_actions: int = 1,
+        eval_seed: int = 0,
     ):
         self.env = env
         self.algorithm = algorithm
@@ -114,6 +120,16 @@ class VmapOffPolicyTrainer:
             Path(diagnostic_snapshot_dir) / f"{self.log_path.name}_pid{os.getpid()}"
             if diagnostic_snapshot_dir is not None else None
         )
+        self.eval_envs = eval_envs
+        self.eval_every = int(eval_every)
+        self.eval_n_episodes = int(eval_n_episodes)
+        self.eval_best_of_n_actions = int(eval_best_of_n_actions)
+        self.eval_enabled = self.eval_envs is not None and self.eval_every > 0
+        self._eval_next_step = None
+        self._eval_action_counter = 0
+        self._eval_keys = jax.random.split(jax.random.key(int(eval_seed)), self.num_runs)
+        self._eval_episode_path = self.log_path / "eval_episode_returns.csv"
+        self._eval_summary_path = self.log_path / "eval_summary.csv"
         self._diagnostic_snapshot_saved_steps = set()
         self._diagnostic_snapshot_rng = np.random.default_rng(
             int(self.hparams.get("seed", 0)) + 7919
@@ -143,6 +159,10 @@ class VmapOffPolicyTrainer:
         if total != self.num_runs * self.envs_per_run:
             raise ValueError(
                 f"env.num_envs={total} but expected num_runs*envs_per_run = {self.num_runs}*{self.envs_per_run} = {self.num_runs * self.envs_per_run}"
+            )
+        if self.eval_enabled and len(self.eval_envs) != self.num_runs:
+            raise ValueError(
+                f"Expected one eval env per run: {self.num_runs}; got {len(self.eval_envs)}"
             )
 
         self.env_name = env.spec.id if env.spec is not None else "env"
@@ -271,6 +291,35 @@ class VmapOffPolicyTrainer:
         self.recorder.init()
         self.logger.set_snr(getattr(self.algorithm, "_snr", None))
         self.logger.init_runs()
+        self._init_eval_csv()
+
+    def _init_eval_csv(self):
+        if not self.eval_enabled:
+            return
+        self.log_path.mkdir(parents=True, exist_ok=True)
+        with open(self._eval_episode_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "seed_index",
+                "step",
+                "eval_best_of_n_actions",
+                "episode_index",
+                "episode_return",
+                "episode_length",
+            ])
+        with open(self._eval_summary_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "seed_index",
+                "step",
+                "eval_best_of_n_actions",
+                "episode_return_mean",
+                "episode_return_std",
+                "episode_return_min",
+                "episode_return_max",
+                "episode_length_mean",
+                "n_episodes",
+            ])
 
     # ------------------------------------------------------------------
     # Warmup (random actions)
@@ -442,6 +491,7 @@ class VmapOffPolicyTrainer:
                 self.update(update_keys[:, i])
             self.progress.n = self.sample_logs[0].sample_step
             self.progress.refresh()
+            self._maybe_evaluate(self.sample_logs[0].sample_step)
             self.logger.flush_all()
         return obs
 
@@ -479,6 +529,7 @@ class VmapOffPolicyTrainer:
 
             self.progress.n = self.sample_logs[0].sample_step
             self.progress.refresh()
+            self._maybe_evaluate(self.sample_logs[0].sample_step)
             self.logger.flush_all()
         return obs
 
@@ -518,12 +569,114 @@ class VmapOffPolicyTrainer:
         q_per_env, v_per_env = self.algorithm.eval_q_v_vmap(obs_nm, action_nm)
         return action_nm, q_per_env, v_per_env
 
+    def _maybe_evaluate(self, step: int) -> None:
+        if not self.eval_enabled:
+            return
+        step = int(step)
+        if self._eval_next_step is None:
+            self._eval_next_step = ((step // self.eval_every) + 1) * self.eval_every
+        if step < self._eval_next_step:
+            return
+
+        self._evaluate_once(step)
+        while self._eval_next_step <= step:
+            self._eval_next_step += self.eval_every
+
+    def _evaluate_once(self, step: int) -> None:
+        obs = np.stack([env.reset()[0] for env in self.eval_envs], axis=0)
+        returns = np.zeros((self.num_runs,), dtype=np.float64)
+        lengths = np.zeros((self.num_runs,), dtype=np.int64)
+        completed_returns = [[] for _ in range(self.num_runs)]
+        completed_lengths = [[] for _ in range(self.num_runs)]
+
+        while any(len(xs) < self.eval_n_episodes for xs in completed_returns):
+            active = np.array(
+                [len(xs) < self.eval_n_episodes for xs in completed_returns],
+                dtype=bool,
+            )
+            obs_nm = obs.reshape(self.num_runs, 1, -1)
+            keys = jax.vmap(lambda k: jax.random.fold_in(k, self._eval_action_counter))(self._eval_keys)
+            self._eval_action_counter += 1
+            action_nm, _ = self.algorithm.get_eval_action_vmap(
+                keys,
+                obs_nm,
+                self.eval_best_of_n_actions,
+            )
+            action_np = np.clip(np.asarray(action_nm)[:, 0, :], -1.0, 1.0)
+            reward = np.zeros((self.num_runs,), dtype=np.float64)
+            done = np.zeros((self.num_runs,), dtype=bool)
+            for s, env in enumerate(self.eval_envs):
+                if not active[s]:
+                    continue
+                obs_s, reward_s, terminated_s, truncated_s, _ = env.step(action_np[s])
+                obs[s] = obs_s
+                reward[s] = reward_s
+                done[s] = bool(terminated_s or truncated_s)
+
+            returns[active] += reward[active]
+            lengths[active] += 1
+            for s in range(self.num_runs):
+                if active[s] and done[s]:
+                    completed_returns[s].append(float(returns[s]))
+                    completed_lengths[s].append(int(lengths[s]))
+                    returns[s] = 0.0
+                    lengths[s] = 0
+                    obs[s], _ = self.eval_envs[s].reset()
+
+        self._log_eval(step, completed_returns, completed_lengths)
+
+    def _log_eval(self, step: int, completed_returns, completed_lengths) -> None:
+        with open(self._eval_episode_path, "a", newline="") as ep_f, open(self._eval_summary_path, "a", newline="") as sum_f:
+            ep_writer = csv.writer(ep_f)
+            sum_writer = csv.writer(sum_f)
+            for s in range(self.num_runs):
+                ret = np.asarray(completed_returns[s], dtype=np.float64)
+                length = np.asarray(completed_lengths[s], dtype=np.float64)
+                for ep_idx, (ep_ret, ep_len) in enumerate(zip(ret, length)):
+                    ep_writer.writerow([
+                        s,
+                        int(step),
+                        self.eval_best_of_n_actions,
+                        ep_idx,
+                        float(ep_ret),
+                        int(ep_len),
+                    ])
+
+                mean = float(ret.mean())
+                std = float(ret.std())
+                min_ret = float(ret.min())
+                max_ret = float(ret.max())
+                length_mean = float(length.mean())
+                sum_writer.writerow([
+                    s,
+                    int(step),
+                    self.eval_best_of_n_actions,
+                    mean,
+                    std,
+                    min_ret,
+                    max_ret,
+                    length_mean,
+                    len(ret),
+                ])
+                self.logger.add_scalar_per_run(s, "eval/episode_return_mean", mean, step=step)
+                self.logger.add_scalar_per_run(s, "eval/episode_return_std", std, step=step)
+                self.logger.add_scalar_per_run(s, "eval/episode_return_min", min_ret, step=step)
+                self.logger.add_scalar_per_run(s, "eval/episode_return_max", max_ret, step=step)
+                self.logger.add_scalar_per_run(s, "eval/episode_length_mean", length_mean, step=step)
+                self.logger.add_scalar_per_run(s, "eval/best_of_n_actions", self.eval_best_of_n_actions, step=step)
+
     def finish(self):
         self.logger.flush_all()
         try:
             self.env.close()
         except Exception:
             pass
+        if self.eval_envs is not None:
+            for env in self.eval_envs:
+                try:
+                    env.close()
+                except Exception:
+                    pass
         if hasattr(self, "progress"):
             self.progress.close()
         self.logger.finish()

@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--diagnostic_snapshot_batch_size", type=int, default=256, help="Number of replay transitions per run to save in each diagnostic snapshot for TD next-action / distillation diagnostics.")
     parser.add_argument("--diagnostic_snapshot_dir", type=str, default=None, help="Directory where diagnostic snapshots are written. Required when --save_diagnostic_snapshots is set.")
 
+    # ----- separate evaluation ---------------------------------------------
+    parser.add_argument("--eval_every", type=int, default=0, help="Run separate evaluation every this many training env steps. Default 0 disables evaluation.")
+    parser.add_argument("--eval_n_episodes", type=int, default=10, help="Number of complete episodes per seed/run for each separate evaluation.")
+    parser.add_argument("--eval_best_of_n_actions", type=int, default=1, help="Best-of-N candidate count used only by separate evaluation. The selected action is executed without post-selection exploration noise.")
+    parser.add_argument("--eval_seed", type=int, default=None, help="Base seed for separate evaluation envs. Default derives one from --seed.")
+
     # ----- networks ---------------------------------------------------------
     parser.add_argument("--hidden_num", type=int, default=3)
     parser.add_argument("--hidden_dim", type=int, default=256)
@@ -269,6 +275,12 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
             parser.error("--save_diagnostic_snapshots requires --diagnostic_snapshot_steps.")
         if args.diagnostic_snapshot_dir is None:
             parser.error("--save_diagnostic_snapshots requires --diagnostic_snapshot_dir.")
+    if args.eval_every < 0:
+        parser.error("--eval_every must be >= 0.")
+    if args.eval_n_episodes <= 0:
+        parser.error("--eval_n_episodes must be > 0.")
+    if args.eval_best_of_n_actions <= 0:
+        parser.error("--eval_best_of_n_actions must be > 0.")
     if args.update_per_iteration <= 0:
         parser.error("--update_per_iteration must be > 0.")
     if args.critic_update_steps <= 0:

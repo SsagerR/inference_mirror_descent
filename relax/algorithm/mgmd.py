@@ -160,6 +160,7 @@ class MGMD:
         stateless_get_action = self._stateless_get_action(rollout_sampler, agg_critic)
         self._jit_vmap_update = jax.jit(jax.vmap(updater))
         self._jit_vmap_get_action = jax.jit(jax.vmap(stateless_get_action))
+        self._jit_vmap_eval_action_by_n = {}
         self._last_rollout_soft_resample_ess = None
         self._last_rollout_soft_resample_pmax = None
         self._last_soft_resample_array_log_step = -float("inf")
@@ -314,6 +315,50 @@ class MGMD:
             )
 
         return stateless_get_action
+
+    def _stateless_eval_action(self, sampler, agg_sample_fn):
+        """Eval-only best-of-N action selector.
+
+        Evaluation intentionally differs from rollout best-of-N in one way:
+        after selecting the highest-Q candidate, it executes that candidate
+        directly, without the learned post-selection Gaussian exploration noise.
+        """
+        def stateless_eval_action(key: jax.Array, state: Diffv2TrainState, obs: jax.Array):
+            result = sampler(key, state, obs, agg_sample_fn)
+            best_idx = jnp.argmax(result.q, axis=0)
+            gather_idx = best_idx[None, ...]
+            while gather_idx.ndim < result.action.ndim:
+                gather_idx = gather_idx[..., None]
+            action = jnp.take_along_axis(result.action, gather_idx, axis=0).squeeze(axis=0)
+            q = jnp.take_along_axis(result.q, best_idx[None, ...], axis=0).squeeze(axis=0)
+            return action, q
+
+        return stateless_eval_action
+
+    def _build_eval_action_vmap(self, num_actions: int):
+        num_actions = int(num_actions)
+        agg_critic = lambda qm: _aggregate_q(qm, self.cfg.q_agg_sample)
+        if self.rsm_variant or self.soft_resample_variant:
+            sampler = build_diffusion_sampler(
+                model=self.model,
+                timesteps=self._timesteps,
+                num_denoised_actions=num_actions,
+                compute_final_q=True,
+            )
+        else:
+            sampler = build_mala_sampler(
+                model=self.model,
+                value_head=self.value_head,
+                timesteps=self._timesteps,
+                batch_independent_guidance=self.cfg.batch_independent_guidance,
+                ema_normalization=bool(self.cfg.advantage_normalization or self.cfg.q_loss_normalization),
+                denoising_predictor=self.cfg.denoising_predictor,
+                guidance_gradient_space=self.cfg.guidance_gradient_space,
+                num_denoised_actions=num_actions,
+                batch_advantage_normalization=self.batch_advantage_normalization,
+                ema_advantage_normalization=self.ema_advantage_normalization,
+            )
+        return jax.jit(jax.vmap(self._stateless_eval_action(sampler, agg_critic)))
 
     def _stateless_best_of_n_training_sampler(self, sampler):
         """Return a TD next-action sampler with DPMD-style best-of-N selection.
@@ -807,6 +852,19 @@ class MGMD:
         v = self.value_head.apply_vmap(self.state.value_params, jnp.asarray(obs))
         v_per_env = np.asarray(v)  # [N, num_envs]
         return action_np, q_per_env, v_per_env
+
+    def get_eval_action_vmap(self, key: jax.Array, obs: np.ndarray, num_actions: int):
+        """Vmapped separate-eval action.
+
+        ``num_actions`` is the evaluation-only best-of-N count. The returned
+        action has shape [num_runs, eval_envs_per_run, act_dim]. This method
+        does not update ``self.state`` or MALA adaptation statistics.
+        """
+        num_actions = int(num_actions)
+        if num_actions not in self._jit_vmap_eval_action_by_n:
+            self._jit_vmap_eval_action_by_n[num_actions] = self._build_eval_action_vmap(num_actions)
+        action, q = self._jit_vmap_eval_action_by_n[num_actions](key, self.state, obs)
+        return np.asarray(action), np.asarray(q)
 
     def _setup_value_network(self, params):
         """Construct the V(s) network used by KL-budget / on-policy-EMA mode.
