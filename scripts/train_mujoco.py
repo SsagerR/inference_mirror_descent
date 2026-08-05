@@ -84,6 +84,7 @@ if __name__ == "__main__":
         save_diagnostic_snapshots=args.save_diagnostic_snapshots,
         diagnostic_snapshot_steps=args.diagnostic_snapshot_steps,
         diagnostic_snapshot_batch_size=args.diagnostic_snapshot_batch_size,
+        diagnostic_snapshot_buffer_fraction=args.diagnostic_snapshot_buffer_fraction,
         diagnostic_snapshot_dir=args.diagnostic_snapshot_dir,
     )
     trainer.setup(Experience.create_example(obs_dim, act_dim, trainer.batch_size))

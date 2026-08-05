@@ -33,6 +33,7 @@ from relax.trainer.wandb_logging import WandbMultiSeedLogger, build_config_tag  
 from relax.utils.experience import Experience
 from relax.utils.diagnostic_snapshot import (
     sample_replay_batches_for_snapshot,
+    sample_replay_buffer_subset_for_snapshot,
     save_diagnostic_snapshot,
 )
 
@@ -87,6 +88,7 @@ class VmapOffPolicyTrainer:
         save_diagnostic_snapshots: bool = False,
         diagnostic_snapshot_steps: Optional[List[int]] = None,
         diagnostic_snapshot_batch_size: int = 256,
+        diagnostic_snapshot_buffer_fraction: float = 0.0,
         diagnostic_snapshot_dir: Optional[str] = None,
     ):
         self.env = env
@@ -110,6 +112,7 @@ class VmapOffPolicyTrainer:
             int(step) for step in (diagnostic_snapshot_steps or [])
         })
         self.diagnostic_snapshot_batch_size = int(diagnostic_snapshot_batch_size)
+        self.diagnostic_snapshot_buffer_fraction = float(diagnostic_snapshot_buffer_fraction)
         self.diagnostic_snapshot_dir = (
             Path(diagnostic_snapshot_dir) / f"{self.log_path.name}_pid{os.getpid()}"
             if diagnostic_snapshot_dir is not None else None
@@ -226,6 +229,14 @@ class VmapOffPolicyTrainer:
             batch_size=self.diagnostic_snapshot_batch_size,
             rng=self._diagnostic_snapshot_rng,
         )
+        replay_buffer_subset = None
+        replay_buffer_subset_indices = None
+        if self.diagnostic_snapshot_buffer_fraction > 0.0:
+            replay_buffer_subset, replay_buffer_subset_indices = sample_replay_buffer_subset_for_snapshot(
+                self.buffers,
+                fraction=self.diagnostic_snapshot_buffer_fraction,
+                rng=self._diagnostic_snapshot_rng,
+            )
         base_metadata = {
             "actual_sample_step": int(step),
             "env_name": self.env_name,
@@ -233,6 +244,10 @@ class VmapOffPolicyTrainer:
             "envs_per_run": int(self.envs_per_run),
             "rollout_obs_shape": list(rollout_obs.shape),
             "replay_batch_size": int(self.diagnostic_snapshot_batch_size),
+            "replay_buffer_subset_fraction": float(self.diagnostic_snapshot_buffer_fraction),
+            "replay_buffer_subset_size": (
+                0 if replay_buffer_subset_indices is None else int(replay_buffer_subset_indices.shape[1])
+            ),
             "buffer_lens": [int(buffer.len) for buffer in self.buffers],
             "total_step": int(self.total_step),
             "start_step": int(self.start_step),
@@ -253,6 +268,8 @@ class VmapOffPolicyTrainer:
                 replay_indices=replay_indices,
                 metadata={**base_metadata, "target_step": int(target)},
                 hparams=self.hparams,
+                replay_buffer_subset=replay_buffer_subset,
+                replay_buffer_subset_indices=replay_buffer_subset_indices,
             )
             print(f"[diagnostic_snapshot] saved {path}")
             self._diagnostic_snapshot_saved_steps.add(target)
