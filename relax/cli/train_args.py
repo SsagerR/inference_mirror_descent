@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_diagnostic_snapshots", action="store_true", default=False, help="Save host-side diagnostic snapshots at selected env steps. Snapshots include the vmapped algorithm state, the next rollout observations, and a fixed replay minibatch for later sampler-distribution analysis.")
     parser.add_argument("--diagnostic_snapshot_steps", type=int, nargs="*", default=[], help="Env-step targets at which to save diagnostic snapshots. The trainer saves the first time the per-run env step reaches or crosses each target.")
     parser.add_argument("--diagnostic_snapshot_batch_size", type=int, default=256, help="Number of replay transitions per run to save in each diagnostic snapshot for TD next-action / distillation diagnostics.")
+    parser.add_argument("--diagnostic_snapshot_buffer_fraction", type=float, default=0.0, help="Optional replay-buffer subset fraction to save per run in each diagnostic snapshot. 0 disables subset saving; 0.1 saves a uniform 10%% subset of each run's current valid buffer without advancing buffer RNGs.")
     parser.add_argument("--diagnostic_snapshot_dir", type=str, default=None, help="Directory where diagnostic snapshots are written. Required when --save_diagnostic_snapshots is set.")
 
     # ----- separate evaluation ---------------------------------------------
@@ -268,6 +269,8 @@ def validate_args(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--num_vec_envs must be > 0.")
     if args.diagnostic_snapshot_batch_size <= 0:
         parser.error("--diagnostic_snapshot_batch_size must be > 0.")
+    if args.diagnostic_snapshot_buffer_fraction < 0.0 or args.diagnostic_snapshot_buffer_fraction > 1.0:
+        parser.error("--diagnostic_snapshot_buffer_fraction must be between 0 and 1.")
     if any(step <= 0 for step in args.diagnostic_snapshot_steps):
         parser.error("--diagnostic_snapshot_steps must contain positive env-step integers.")
     if args.save_diagnostic_snapshots:

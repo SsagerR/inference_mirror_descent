@@ -99,6 +99,7 @@ if __name__ == "__main__":
         save_diagnostic_snapshots=args.save_diagnostic_snapshots,
         diagnostic_snapshot_steps=args.diagnostic_snapshot_steps,
         diagnostic_snapshot_batch_size=args.diagnostic_snapshot_batch_size,
+        diagnostic_snapshot_buffer_fraction=args.diagnostic_snapshot_buffer_fraction,
         diagnostic_snapshot_dir=args.diagnostic_snapshot_dir,
         eval_envs=eval_envs,
         eval_every=args.eval_every,
